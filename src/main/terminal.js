@@ -31,6 +31,34 @@ const shells = {
 // you instead of showing a blank screen.
 const BUFFER_CAP = 200_000;
 
+// Trims a terminal's saved output down to at most `cap` characters, cutting
+// from the front (the oldest output) once it grows past the cap.
+//
+// A naive "just cut at exactly `cap` characters" would sometimes slice
+// straight through the middle of an ANSI escape sequence — the invisible
+// codes a shell uses to set colors, move the cursor, etc. (they always
+// start with the "ESC" character, \x1b). If we replay a buffer that starts
+// mid-sequence, the leftover half of that broken code gets printed as
+// visible garbage instead of being understood as a command — this is one
+// of the ways terminal text can end up looking corrupted/garbled after
+// reattaching to a terminal. To avoid that, once we know roughly where
+// we're cutting, we look a little further forward for a safer spot to
+// actually start from: ideally the beginning of the next escape sequence
+// (so nothing is left dangling), or otherwise right after the next
+// newline (so at least we're not mid-line). We only ever look a small
+// distance ahead, so this never meaningfully changes how much history is
+// kept.
+function trimBufferSafely(text, cap) {
+  if (text.length <= cap) return text;
+  const rawCut = text.length - cap;
+  const lookahead = text.slice(rawCut, rawCut + 256);
+  const escIndex = lookahead.indexOf('\x1b');
+  if (escIndex !== -1) return text.slice(rawCut + escIndex);
+  const newlineIndex = lookahead.indexOf('\n');
+  if (newlineIndex !== -1) return text.slice(rawCut + newlineIndex + 1);
+  return text.slice(rawCut);
+}
+
 // Maps each terminal's unique id to its live process and buffered output.
 const terminals = new Map(); // id -> { pty, buffer }
 let nextId = 1;
@@ -98,7 +126,7 @@ function createTerminal(cwd) {
   // immediately forward it to the screen so it appears live, character by
   // character, just like typing directly into a real terminal window.
   ptyProcess.onData((data) => {
-    entry.buffer = (entry.buffer + data).slice(-BUFFER_CAP);
+    entry.buffer = trimBufferSafely(entry.buffer + data, BUFFER_CAP);
     broadcast('terminal:data', id, data);
   });
   // When the shell process ends (e.g. you type "exit"), let the UI know so

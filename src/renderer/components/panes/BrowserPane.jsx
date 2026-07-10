@@ -148,8 +148,22 @@ export default function BrowserPane({ tab, workspace }) {
   // opposed to it just displaying the current page's URL).
   const [editing, setEditing] = useState(false);
   // Whether the vertical tab rail is shown expanded (with titles/text) or
-  // collapsed to just icons, remembered per-tab so it's restored next time.
+  // collapsed to just icons — this is the user's own preference, remembered
+  // per-tab so it's restored next time. It can still end up collapsed on
+  // screen even when this is true, though: see "narrow" below.
   const [railExpanded, setRailExpanded] = useState(tab.config?.railExpanded !== false);
+  // A reference to this whole pane's outer element, used below to measure
+  // its actual on-screen width so the tab rail can respond to it.
+  const rootRef = useRef(null);
+  // Whether this pane is currently too narrow to comfortably show the
+  // expanded (titled) tab rail without leaving barely any room for the
+  // actual page — kept live by the ResizeObserver below, the same
+  // responsive approach used for the Explorer in EditorPane.jsx. When
+  // true, the rail is forced to its icon-only width regardless of the
+  // user's own railExpanded preference above, which is left untouched so
+  // widening the pane back out restores exactly what they had before.
+  const [narrow, setNarrow] = useState(false);
+  const showExpandedRail = railExpanded && !narrow;
   // A reference to the empty "page area" div — its on-screen position and
   // size is measured continuously and reported to the background process,
   // so it knows exactly where to draw the real webpage.
@@ -213,6 +227,25 @@ export default function BrowserPane({ tab, workspace }) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paneId]);
+
+  // --- Responsive tab rail: watch this pane's actual on-screen width.
+  // In plain terms: this is what makes "narrow" above stay accurate as the
+  // pane is resized — whether that's the window shrinking, a split
+  // divider being dragged, or the app's own sidebar being toggled open.
+  // Below a certain width, showing the full titled tab rail would leave
+  // barely any room for the actual page, so it gets forced down to its
+  // compact icon-only width instead (see showExpandedRail above).
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return undefined;
+    const NARROW_BREAKPOINT = 480;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? el.clientWidth;
+      setNarrow(width < NARROW_BREAKPOINT);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   // --- Viewport tracking: report the content area's rect whenever it changes.
   // In plain terms: this runs a tiny loop, once per animation frame (about
@@ -346,7 +379,11 @@ export default function BrowserPane({ tab, workspace }) {
   const loading = !!activeTab?.loading;
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-app" onKeyDown={handleChromeKeys}>
+    <div
+      ref={rootRef}
+      className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-app"
+      onKeyDown={handleChromeKeys}
+    >
       {/* Chrome row: nav + address bar */}
       <form
         onSubmit={handleSubmit}
@@ -419,9 +456,13 @@ export default function BrowserPane({ tab, workspace }) {
           type="button"
           onClick={() => setRailExpanded((v) => !v)}
           className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-ink-dim transition-colors duration-100 hover:bg-hover hover:text-ink"
-          title={railExpanded ? 'Collapse tab rail' : 'Expand tab rail'}
+          // While narrow, the rail is forced compact regardless of this
+          // button's own on/off preference (see showExpandedRail above) —
+          // the label reflects that, so it doesn't claim an action it
+          // can't actually perform right now.
+          title={narrow ? 'Not enough room to expand the tab rail' : showExpandedRail ? 'Collapse tab rail' : 'Expand tab rail'}
         >
-          <RailToggleIcon expanded={railExpanded} />
+          <RailToggleIcon expanded={showExpandedRail} />
         </button>
 
         {/* Thin accent loading line, flush with the bottom of the chrome row. */}
@@ -436,7 +477,7 @@ export default function BrowserPane({ tab, workspace }) {
         {/* Vertical tab rail */}
         <div
           className={`flex shrink-0 flex-col gap-0.5 overflow-y-auto overflow-x-hidden py-1 pl-1.5 pr-1 transition-[width] duration-150 [scrollbar-width:none] ${
-            railExpanded ? 'w-[188px]' : 'w-[40px]'
+            showExpandedRail ? 'w-[188px]' : 'w-[40px]'
           }`}
         >
           {state.tabs.map((t) => (
@@ -444,7 +485,7 @@ export default function BrowserPane({ tab, workspace }) {
               key={t.id}
               tab={t}
               active={t.id === state.activeTabId}
-              expanded={railExpanded}
+              expanded={showExpandedRail}
               onActivate={() => window.browser.activateTab(paneId, t.id)}
               onClose={() => window.browser.closeTab(paneId, t.id)}
             />
@@ -453,14 +494,14 @@ export default function BrowserPane({ tab, workspace }) {
             type="button"
             onClick={() => window.browser.newTab(paneId)}
             className={`flex h-8 shrink-0 items-center gap-2 rounded-md px-2 text-[12px] text-ink-dim transition-colors duration-100 hover:bg-hover/50 hover:text-ink ${
-              railExpanded ? '' : 'justify-center px-0'
+              showExpandedRail ? '' : 'justify-center px-0'
             }`}
             title="New tab (Ctrl+T)"
           >
             <span className="flex h-4 w-4 shrink-0 items-center justify-center">
               <PlusIcon />
             </span>
-            {railExpanded && <span>New tab</span>}
+            {showExpandedRail && <span>New tab</span>}
           </button>
         </div>
 

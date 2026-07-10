@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 
 // "xterm.js" is a library that draws a fully working terminal screen (with
@@ -50,6 +51,26 @@ function getPlatformInfo() {
   if (!platformInfoPromise) platformInfoPromise = window.terminals.platformInfo();
   return platformInfoPromise;
 }
+
+// Keeps a full, faithful snapshot of each terminal's on-screen contents —
+// colors, cursor position, and (crucially) whether a full-screen program
+// like vim or htop had taken over the display — captured the instant its
+// pane goes away (e.g. you switch to a different workspace, which throws
+// away this component and its on-screen xterm.js widget, even though the
+// real shell process keeps running in the background).
+//
+// This exists because the background shell process only remembers its
+// output as a flat, raw stream of text (see terminal.js). Replaying that
+// raw stream into a brand-new, blank terminal widget can't correctly
+// reconstruct anything that depended on the OLD terminal's state — like a
+// full-screen program's layout — and can visibly show up as scrambled
+// text. A proper snapshot (made with xterm.js's own "serialize" addon)
+// instead captures a faithful description of exactly what was on screen,
+// which restores correctly. This only lives in memory for as long as the
+// app is running (cleared on restart) — that's fine, since after a full
+// restart there's no live screen left to snapshot anyway, and we fall back
+// to the raw output log in that case instead (see startTerminal below).
+const terminalSnapshots = new Map();
 
 export default function TerminalPane({ tab, workspace }) {
   // A reference to the empty <div> below where xterm.js will draw the
@@ -111,19 +132,29 @@ export default function TerminalPane({ tab, workspace }) {
 
       const fitAddon = new FitAddon();
       term.loadAddon(fitAddon);
+      // Lets us capture a faithful snapshot of this terminal's on-screen
+      // contents when its pane goes away — see terminalSnapshots above.
+      const serializeAddon = new SerializeAddon();
+      term.loadAddon(serializeAddon);
       term.open(container);
+
+      terminalRef.current = term;
+      fitAddonRef.current = fitAddon;
 
       // Fit after paint so the container has real dimensions.
       // In other words: right when the terminal is created, its container
       // might not have its final on-screen size yet, so we wait one frame
       // (requestAnimationFrame) before asking the terminal to resize itself
-      // to fit — otherwise it might size itself to 0×0 and look broken.
-      requestAnimationFrame(() => {
-        fitAddon.fit();
-      });
-
-      terminalRef.current = term;
-      fitAddonRef.current = fitAddon;
+      // to fit — otherwise it might size itself to 0×0 and look broken. We
+      // deliberately WAIT for this to finish (instead of firing it off and
+      // moving on) before reattaching/starting the shell below — otherwise
+      // the very first size we'd report to the background shell would be
+      // xterm.js's default 80x24, not the real on-screen size, and a
+      // reattached shell would keep wrapping its text for the wrong width
+      // until the next resize happened to fix it.
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      if (cancelled) return;
+      fitAddon.fit();
 
       // Tells the background shell process how many rows/columns of text fit
       // on screen right now, so it can wrap output correctly (the same way a
@@ -149,7 +180,17 @@ export default function TerminalPane({ tab, workspace }) {
         if (savedId) {
           const { alive, buffer } = await window.terminals.attach(savedId);
           if (alive) {
-            if (buffer) term.write(buffer);
+            // Prefer a proper in-memory snapshot from earlier in this same
+            // app session (correctly reconstructs full-screen programs,
+            // colors, cursor position, etc.) over the raw output log, which
+            // can only be blindly replayed as flat text. See
+            // terminalSnapshots above for why this distinction matters.
+            const snapshot = terminalSnapshots.get(savedId);
+            if (snapshot) {
+              term.write(snapshot);
+            } else if (buffer) {
+              term.write(buffer);
+            }
             termIdRef.current = savedId;
             syncSize(savedId);
             return;
@@ -238,7 +279,20 @@ export default function TerminalPane({ tab, workspace }) {
         onData();
         onExit();
         // The pty stays alive; it is killed when the tab is closed, not when
-        // this component unmounts (tab switch / pane move).
+        // this component unmounts (tab switch / pane move). Since the shell
+        // keeps running without an on-screen widget attached to it, save a
+        // snapshot of exactly what this terminal looked like right now, so
+        // reopening it later in this session can restore it faithfully
+        // instead of falling back to replaying raw output (see
+        // terminalSnapshots above).
+        if (termIdRef.current) {
+          try {
+            terminalSnapshots.set(termIdRef.current, serializeAddon.serialize());
+          } catch {
+            // Best-effort only — if this fails for any reason, reattaching
+            // will simply fall back to the raw-output replay path instead.
+          }
+        }
         term.dispose();
       };
     };

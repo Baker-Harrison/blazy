@@ -1,12 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Editor from '@monaco-editor/react';
-import { ChevronIcon, FileIcon, FolderIcon } from '../icons';
+import { ChevronIcon, FileIcon, FolderIcon, PanelLeftIcon } from '../icons';
 
 // The code Editor pane: a mini file browser (the "Explorer" panel) on the
 // left, showing the folders/files inside the current workspace, and the
 // actual text editor (powered by Monaco — the same engine as VS Code) on
 // the right, for editing whichever file is selected. This gives the app a
 // basic VS-Code-like editing experience.
+// Below this width (in pixels), docking the file tree AND the code editor
+// side-by-side leaves too little room for either to be comfortably usable
+// (the classic symptom: everything looks "squished," lines run off the
+// right edge, and you end up scrolling constantly in both directions). See
+// the ResizeObserver in EditorPane below, which measures the pane's actual
+// on-screen width live and switches the Explorer into a compact,
+// pop-open-when-needed drawer once the pane gets this narrow — instead of
+// permanently shrinking everything to fit.
+const NARROW_BREAKPOINT = 560;
+
 export default function EditorPane({ tab, workspace }) {
   const rootPath = workspace.workspace?.path;
   // The folder tree data (files and subfolders) to show in the Explorer.
@@ -19,6 +29,64 @@ export default function EditorPane({ tab, workspace }) {
   const [selectedFile, setSelectedFile] = useState(tab.config?.filePath || null);
   // The text content of the currently open file.
   const [content, setContent] = useState('');
+  // A reference to this whole pane's outer element, used below to measure
+  // its actual on-screen width so the layout can adapt as it's resized.
+  const containerRef = useRef(null);
+  // Whether this pane is currently too narrow to comfortably show the file
+  // tree docked next to the editor at the same time. Kept up to date live
+  // by a ResizeObserver below — dragging a split divider, resizing the
+  // window, or opening/closing the app's own sidebar can all change this.
+  const [narrow, setNarrow] = useState(false);
+  // Whether the Explorer is shown docked open on a WIDE pane (ignored while
+  // "narrow" — see the drawer handling below instead). Remembered per tab,
+  // the same way BrowserPane remembers its own collapsible tab rail.
+  const [explorerOpen, setExplorerOpen] = useState(tab.config?.explorerOpen !== false);
+  // On a narrow pane, the Explorer isn't docked at all — it's a temporary
+  // floating drawer that pops out over the editor and closes itself again,
+  // so browsing files never permanently steals width from the code. This
+  // tracks whether that drawer is currently popped open.
+  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  // Watch this pane's actual on-screen width and flip into "narrow" mode
+  // once it drops below NARROW_BREAKPOINT — this is what makes the
+  // Explorer responsive to ANY size change (window resize, split-divider
+  // drag, sidebar toggle), not just how big the pane happened to be when
+  // it was first opened.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return undefined;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? el.clientWidth;
+      setNarrow(width < NARROW_BREAKPOINT);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  // If the pane grows back past the narrow breakpoint (e.g. the user
+  // widens the split, or maximizes the window), don't leave a stale
+  // drawer hanging open — it was only ever meant to be a temporary,
+  // narrow-pane affordance.
+  useEffect(() => {
+    if (!narrow) setDrawerOpen(false);
+  }, [narrow]);
+
+  // Toggles the Explorer. What exactly that means depends on how much room
+  // there currently is: on a wide pane it docks/undocks a real column (and
+  // remembers your preference for next time); on a narrow pane there's no
+  // room to dock anything, so it just pops the floating drawer open/closed
+  // instead.
+  const toggleExplorer = () => {
+    if (narrow) {
+      setDrawerOpen((v) => !v);
+      return;
+    }
+    setExplorerOpen((v) => {
+      const next = !v;
+      workspace.updateTab(tab.id, { config: { ...tab.config, explorerOpen: next } });
+      return next;
+    });
+  };
   // A little timer we use to "debounce" autosaving — instead of writing to
   // disk on every single keystroke (which would be wasteful), we wait for
   // a short pause in typing before actually saving.
@@ -147,33 +215,88 @@ export default function EditorPane({ tab, workspace }) {
   };
 
   // Opens a file for editing, and remembers which file was opened on this
-  // tab so reopening the tab later brings you back to the same file.
+  // tab so reopening the tab later brings you back to the same file. Also
+  // closes the floating drawer, if it happened to be open — picking a file
+  // from it is the natural "I'm done with this drawer" signal, the same
+  // way choosing an item from a mobile app's slide-out menu closes it.
   const openFile = (filePath) => {
     setSelectedFile(filePath);
     workspace.updateTab(tab.id, { config: { ...tab.config, filePath } });
+    setDrawerOpen(false);
   };
 
+  // The actual file/folder tree, shared between the two places it can
+  // appear below (docked in the sidebar column, or inside the floating
+  // drawer) so both stay in sync automatically instead of drifting apart.
+  const explorerTree = (
+    <div className="min-h-0 flex-1 overflow-y-auto py-1">
+      {tree.map((entry) => (
+        <TreeNode
+          key={entry.path}
+          entry={entry}
+          level={0}
+          expanded={expanded}
+          selectedFile={selectedFile}
+          onToggle={toggleFolder}
+          onSelect={openFile}
+        />
+      ))}
+    </div>
+  );
+
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-1 bg-app">
-      {/* Left sidebar: the file/folder tree ("Explorer"). */}
-      <div className="flex w-48 shrink-0 flex-col border-r border-edge bg-surface">
-        <div className="flex h-8 shrink-0 items-center border-b border-edge px-3 text-[11px] font-medium uppercase tracking-wide text-ink-dim">
-          Explorer
+    <div ref={containerRef} className="relative flex h-full min-h-0 min-w-0 flex-1 bg-app">
+      {/* Left sidebar: the file/folder tree ("Explorer"). On a wide pane
+          this is a normal docked column you can collapse to a thin icon
+          rail. On a narrow pane (see NARROW_BREAKPOINT above) there simply
+          isn't room to dock it at all without squeezing the editor down to
+          the point of being unusable — so it's ALWAYS shown as just the
+          icon rail there, and clicking it pops open a temporary floating
+          drawer (below) instead of a permanent column. */}
+      <div
+        className={`flex shrink-0 flex-col border-r border-edge bg-surface transition-[width] duration-150 ${
+          !narrow && explorerOpen ? 'w-48' : 'w-9'
+        }`}
+      >
+        <div className="flex h-8 shrink-0 items-center justify-between border-b border-edge px-2">
+          {!narrow && explorerOpen && (
+            <span className="truncate pl-1 text-[11px] font-medium uppercase tracking-wide text-ink-dim">
+              Explorer
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={toggleExplorer}
+            className={`ml-auto flex h-6 w-6 shrink-0 items-center justify-center rounded text-ink-dim hover:bg-hover hover:text-ink ${
+              drawerOpen ? 'bg-hover text-ink' : ''
+            }`}
+            title={narrow || !explorerOpen ? 'Show file explorer' : 'Hide file explorer'}
+          >
+            <PanelLeftIcon />
+          </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto py-1">
-          {tree.map((entry) => (
-            <TreeNode
-              key={entry.path}
-              entry={entry}
-              level={0}
-              expanded={expanded}
-              selectedFile={selectedFile}
-              onToggle={toggleFolder}
-              onSelect={openFile}
-            />
-          ))}
-        </div>
+        {!narrow && explorerOpen && explorerTree}
       </div>
+
+      {/* Floating drawer: only reachable on a narrow pane, and only once
+          toggled open. It's positioned ON TOP of the editor (absolute,
+          with a click-to-dismiss backdrop) rather than squeezing it, so
+          browsing files never costs the editor any of the width it needs
+          to stay readable. */}
+      {narrow && drawerOpen && (
+        <>
+          <div
+            className="absolute inset-0 z-10 bg-black/30"
+            onClick={() => setDrawerOpen(false)}
+          />
+          <div className="absolute inset-y-0 left-0 z-20 flex w-56 max-w-[75%] flex-col border-r border-edge bg-surface shadow-lg">
+            <div className="flex h-8 shrink-0 items-center border-b border-edge px-3 text-[11px] font-medium uppercase tracking-wide text-ink-dim">
+              Explorer
+            </div>
+            {explorerTree}
+          </div>
+        </>
+      )}
 
       {/* Right side: either the code editor for the selected file, or a
           placeholder message if nothing is selected yet. */}
@@ -216,6 +339,15 @@ export default function EditorPane({ tab, workspace }) {
                   fontSize: 13,
                   automaticLayout: true, // Keeps the editor correctly sized as its container resizes.
                   scrollBeyondLastLine: false,
+                  // Wraps long lines to fit the visible width instead of
+                  // running off the right edge and forcing you to scroll
+                  // sideways to read them — this is what actually fixes
+                  // "some text is off the right side of this editor" on a
+                  // narrow pane, since a fixed font size alone can't make
+                  // arbitrarily long lines fit without either shrinking
+                  // text to an unreadable size or wrapping it.
+                  wordWrap: 'on',
+                  wrappingIndent: 'same',
                 }}
               />
             </div>

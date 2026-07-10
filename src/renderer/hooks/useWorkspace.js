@@ -30,6 +30,17 @@ import {
 // on disk and, if it's in an old/outdated format, converts it into the
 // current format so old saved workspaces keep working correctly instead of
 // breaking after an app update.
+// While you're dragging a split divider, the resizable-panels library
+// reports a brand new set of sizes on nearly every animation frame (dozens
+// of times a second). If we saved every one of those to disk immediately,
+// we'd flood the background process with database writes while you drag —
+// which competes for the same background process that's also streaming
+// live terminal output, and can make both the drag itself AND any open
+// terminals feel laggy/stuttery. So instead we wait for the drag to pause
+// for this many milliseconds before actually writing to disk — the on
+// screen sizes still update instantly, only the SAVE is delayed.
+const RESIZE_PERSIST_DELAY_MS = 200;
+
 function migrateLegacyLayout(node) {
   if (!node || !node.type) return null;
   if (node.type === 'tabs') {
@@ -68,6 +79,11 @@ export function useWorkspace(workspaceId) {
   const focusedPaneRef = useRef(focusedPaneId);
   layoutRef.current = layout;
   focusedPaneRef.current = focusedPaneId;
+
+  // Holds the pending "save to disk" timer for split-resize drags (see
+  // RESIZE_PERSIST_DELAY_MS above and resizeSplit below) — kept as a ref so
+  // it survives across renders without itself triggering one.
+  const resizePersistTimerRef = useRef(null);
 
   // Keep the focused pane pointing at a pane that actually exists.
   // In plain terms: if the pane that was focused gets closed/merged away
@@ -401,13 +417,43 @@ export function useWorkspace(workspaceId) {
     [applyLayout]
   );
 
-  // Persist new sizes for a (possibly nested) split after a resize drag.
+  // Update the sizes of a (possibly nested) split while the user is
+  // actively dragging its divider.
+  //
+  // In plain terms: this is called continuously (many times per second)
+  // while you drag a divider between two panes. Unlike every other action
+  // in this file, it deliberately does NOT go through applyLayout — it
+  // updates what's on screen right away (so dragging still feels instant),
+  // but saving the new sizes to disk is debounced (delayed until the drag
+  // pauses) instead of happening on every single frame. See
+  // RESIZE_PERSIST_DELAY_MS above for why.
   const resizeSplit = useCallback(
     (splitId, sizes) => {
-      applyLayout((prev) => setSplitSizes(prev, splitId, sizes));
+      const next = setSplitSizes(layoutRef.current, splitId, sizes);
+      layoutRef.current = next;
+      setLayout(next);
+
+      if (resizePersistTimerRef.current) clearTimeout(resizePersistTimerRef.current);
+      resizePersistTimerRef.current = setTimeout(() => {
+        resizePersistTimerRef.current = null;
+        persistLayout(layoutRef.current);
+      }, RESIZE_PERSIST_DELAY_MS);
     },
-    [applyLayout]
+    [persistLayout]
   );
+
+  // If a resize's debounced save hasn't fired yet when this workspace is
+  // switched away from (or the whole app closes), don't just drop it —
+  // save immediately so the size you dragged to isn't silently lost.
+  useEffect(() => {
+    return () => {
+      if (resizePersistTimerRef.current) {
+        clearTimeout(resizePersistTimerRef.current);
+        resizePersistTimerRef.current = null;
+        persistLayout(layoutRef.current);
+      }
+    };
+  }, [persistLayout]);
 
   // The id of whichever tab is currently active within the focused pane —
   // recalculated only when the layout or focused pane actually changes.
