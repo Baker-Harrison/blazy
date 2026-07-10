@@ -1,9 +1,11 @@
 const { app, BrowserWindow, Menu, ipcMain, dialog } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const db = require('./db');
 const { registerTerminalHandlers } = require('./terminal');
 const { registerFileHandlers } = require('./files');
 const { registerBrowserHandlers } = require('./browser');
+const { registerUpdaterHandlers } = require('./updater');
 
 if (!app.isPackaged) {
   try {
@@ -110,8 +112,15 @@ app.whenReady().then(async () => {
   registerTerminalHandlers();
   registerFileHandlers();
   registerBrowserHandlers(() => mainWindow);
+  registerUpdaterHandlers(() => mainWindow);
   await db.ensureInit();
   createWindow();
+
+  if (app.isPackaged) {
+    setTimeout(() => {
+      autoUpdater.checkForUpdates().catch(() => {});
+    }, 3000);
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
