@@ -1,6 +1,6 @@
 {
   "name": "blazy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Blazy",
   "main": "src/main/main.js",
   "private": true,
