@@ -2,6 +2,13 @@ import { useEffect, useRef, useState } from 'react';
 import { CloseIcon, PlusIcon } from '../icons';
 import { PANE_TYPES, paneIcon, paneLabel } from '../../lib/paneTypes';
 
+let overlayRefCount = 0;
+function setBrowserOverlay(open) {
+  overlayRefCount += open ? 1 : -1;
+  if (overlayRefCount < 0) overlayRefCount = 0;
+  window.browser?.setOverlayOpen(overlayRefCount > 0);
+}
+
 export default function TabBar({ pane, tabs, workspace }) {
   const { activateTab, closeTab, createTab, reorderTabInPane, moveTabToPane } = workspace;
   const paneId = pane.id;
@@ -209,6 +216,11 @@ function TabContextMenu({ menu, paneId, tabCount, workspace, onClose }) {
   const ref = useRef(null);
   const [pos, setPos] = useState({ x: menu.x, y: menu.y });
 
+  useEffect(() => {
+    setBrowserOverlay(true);
+    return () => setBrowserOverlay(false);
+  }, []);
+
   // Keep the menu on-screen.
   useEffect(() => {
     if (!ref.current) return;
@@ -284,6 +296,13 @@ function TabContextMenu({ menu, paneId, tabCount, workspace, onClose }) {
 
 function TabAddButton({ onSelect }) {
   const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (open) setBrowserOverlay(true);
+    return () => {
+      if (open) setBrowserOverlay(false);
+    };
+  }, [open]);
 
   return (
     <div className="relative shrink-0">

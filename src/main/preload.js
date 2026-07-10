@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld('browser', {
   ensurePane: (paneId, saved) => ipcRenderer.invoke('browser:ensurePane', paneId, saved),
   setViewport: (paneId, bounds, visible) =>
     ipcRenderer.send('browser:setViewport', paneId, bounds, visible),
+  setOverlayOpen: (open) => ipcRenderer.send('browser:setOverlayOpen', open),
   newTab: (paneId, url) => ipcRenderer.send('browser:newTab', paneId, url),
   closeTab: (paneId, tabId) => ipcRenderer.send('browser:closeTab', paneId, tabId),
   activateTab: (paneId, tabId) => ipcRenderer.send('browser:activateTab', paneId, tabId),

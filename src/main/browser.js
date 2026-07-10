@@ -10,6 +10,7 @@ const BG = '#16171b';
 
 let win = null;
 let nextTabId = 1;
+let overlayOpen = false;
 
 // paneId -> { tabs: Map<tabId, TabEntry>, order: [tabId], activeTabId,
 //             bounds, visible }
@@ -173,7 +174,7 @@ function applyVisibility(paneId) {
   for (const id of pane.order) {
     const tab = pane.tabs.get(id);
     if (!tab?.view) continue;
-    const show = pane.visible && id === pane.activeTabId && pane.bounds;
+    const show = !overlayOpen && pane.visible && id === pane.activeTabId && pane.bounds;
     if (show) {
       win.contentView.addChildView(tab.view);
       tab.view.setBounds(pane.bounds);
@@ -318,6 +319,11 @@ function registerBrowserHandlers(getWindow) {
   ipcMain.on('browser:stop', (_e, paneId) => activeWebContents(paneId)?.stop());
   ipcMain.on('browser:focusPage', (_e, paneId) => activeWebContents(paneId)?.focus());
   ipcMain.on('browser:destroyPane', (_e, paneId) => destroyPane(paneId));
+
+  ipcMain.on('browser:setOverlayOpen', (_e, open) => {
+    overlayOpen = !!open;
+    for (const paneId of panes.keys()) applyVisibility(paneId);
+  });
 }
 
 module.exports = { registerBrowserHandlers };
