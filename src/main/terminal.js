@@ -133,6 +133,18 @@ function createTerminal(cwd) {
     ...process.env,
     TERM: 'xterm-256color', // Tells programs the terminal supports rich colors/formatting.
     COLORTERM: 'truecolor',
+    // Tells programs this terminal understands real clickable hyperlinks
+    // (the "OSC 8" kind — see TerminalPane.jsx / filePathLinks.js).
+    // Modern CLI tools (Claude Code among them) check the environment for
+    // signals like this before emitting a real link: without them they
+    // print file names as plain colored text instead. Blazy handles both
+    // real OSC 8 links AND plain-text path matching, so we announce
+    // support. FORCE_HYPERLINK is the widely-recognized "yes, emit them"
+    // override; WT_SESSION is what Windows Terminal sets and is another
+    // allowlisted signal several tools (including the supports-hyperlinks
+    // library Claude Code uses) look for.
+    FORCE_HYPERLINK: '1',
+    WT_SESSION: process.env.WT_SESSION || 'blazy',
   };
   // Avoid double-forcing Electron/Chromium color modes into the shell session.
   delete env.FORCE_COLOR;

@@ -3,9 +3,15 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
+import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
 import { pathForTerminalDrop } from '../../lib/dragPaste';
 import { handleTerminalKeyEvent } from '../../lib/terminalClipboard';
+import { findPaneWithTab } from '../../lib/layoutTree';
+import {
+  openFileLink,
+  createFilePathLinkProvider,
+} from '../../lib/filePathLinks';
 
 // "xterm.js" is a library that draws a fully working terminal screen (with
 // a blinking cursor, colored text, scrollback, etc.) inside a web page —
@@ -102,6 +108,49 @@ function sessionByTermId(termId) {
   return null;
 }
 
+// ── Clickable links in terminal output ──
+//
+// Two separate systems work together here:
+//
+//   1. WebLinksAddon (default rules) — underlines ordinary web URLs like
+//      "https://example.com" and opens them in the in-app browser.
+//
+//   2. Our own file-path link provider (see filePathLinks.js) — underlines
+//      printed file paths like "demo/index.html" or "C:\Users\you\a.txt"
+//      and opens them in the in-app editor. We deliberately do NOT reuse
+//      WebLinksAddon for file paths: that addon always runs a "is this a
+//      real URL?" filter after its regex match, which silently throws away
+//      every ordinary file path (they aren't valid URLs). That was why
+//      Claude Code's blue file names used to do nothing when clicked.
+//
+//   3. Native OSC 8 hyperlinks — some modern CLI tools (Claude Code when
+//      it detects hyperlink support) wrap text in an invisible "this is a
+//      link, and its REAL target is X" tag. xterm.js parses those natively
+//      via `linkHandler` below; we route http(s) to the browser and
+//      everything else (usually a file:// URI) to the editor.
+
+// Called when a web-URL link (matched by the default WebLinksAddon) is
+// clicked in a terminal: opens it in the in-app browser, reusing a browser
+// tab already open in the SAME split pane as this terminal if there is one.
+function openUrlLink(session, url) {
+  const workspace = session.workspace;
+  if (!workspace?.layout) return;
+  const paneId = findPaneWithTab(workspace.layout, session.tabId)?.id;
+  if (!paneId) return;
+  workspace.openUrlInPane(paneId, url);
+}
+
+// Routes a native OSC 8 hyperlink click: web URLs go to the browser,
+// anything else is treated as a file path/URI for the editor (only if it
+// turns out to actually exist — see openFileLink in filePathLinks.js).
+function handleNativeHyperlink(session, targetText) {
+  if (/^https?:\/\//i.test(targetText)) {
+    openUrlLink(session, targetText);
+  } else {
+    openFileLink(session, targetText);
+  }
+}
+
 // Fully tears down a session: destroys the on-screen widget and forgets
 // it. Only called once the shell process is gone AND the tab is no longer
 // on screen — never for a mere tab switch.
@@ -156,6 +205,15 @@ async function createSession(tabId, host, savedTerminalId, cwd, onNewTerminalId)
   // on before creating the terminal — see the windowsPty option below.
   const platformInfo = await getPlatformInfo();
 
+  // Declared before the Terminal itself, because the `linkHandler` option
+  // passed to the Terminal's constructor (just below) needs to be able to
+  // reach this tab's session object — but that object isn't built until
+  // just after the terminal is. Its handlers only ever actually RUN later,
+  // in response to a real click, by which point `session` further down has
+  // long since been assigned — a plain closure over this variable is all
+  // that's needed to bridge the two.
+  let session = null;
+
   const term = new Terminal({
     theme: THEME,
     fontFamily: '"Cascadia Code", ui-monospace, Consolas, monospace',
@@ -186,6 +244,20 @@ async function createSession(tabId, host, savedTerminalId, cwd, onNewTerminalId)
       platformInfo.platform === 'win32'
         ? { backend: 'conpty', buildNumber: platformInfo.windowsBuild }
         : undefined,
+    // Intercepts real OSC 8 terminal hyperlinks (see the big comment on
+    // handleNativeHyperlink above) instead of letting xterm.js fall back to
+    // its own default behavior of calling window.open() on click, which is
+    // what was popping open a bare, chrome-less new Electron window.
+    linkHandler: {
+      // OSC 8 links aren't required to be http(s) — e.g. a "file://" link
+      // to a local file. Without this flag, xterm.js silently drops any
+      // link whose target isn't http(s) rather than ever calling activate()
+      // for it, which would make local-file OSC 8 links do nothing at all.
+      allowNonHttpProtocols: true,
+      activate: (_event, targetText) => {
+        if (session) handleNativeHyperlink(session, targetText);
+      },
+    },
   });
 
   const fitAddon = new FitAddon();
@@ -219,17 +291,54 @@ async function createSession(tabId, host, savedTerminalId, cwd, onNewTerminalId)
     // WebGL unavailable — the built-in renderer is used automatically.
   }
 
-  const session = {
+  // Assigns to the `session` variable declared above (not a fresh `const`)
+  // — the linkHandler wired into the Terminal's constructor options above
+  // already closed over that variable, and is now able to see this object
+  // once a click actually happens.
+  session = {
     tabId,
     host,
     term,
     fitAddon,
+    // The folder this terminal's shell was started in — used by
+    // openFileLink above to turn a RELATIVE printed path (like
+    // "demo/index.html") into a full one it can actually check and open.
+    // (If the user later `cd`s somewhere else inside the shell, we have no
+    // way of knowing — the starting folder is our best available guess, and
+    // the exists-check in openFileLink keeps a wrong guess harmless.)
+    cwd: cwd || null,
     termId: savedTerminalId || null,
     queue: [], // Park live output until we've finished catching up below.
     dead: false,
     mounted: true,
+    // The latest `workspace` object passed down from whichever TerminalPane
+    // component currently has this tab mounted. This session object lives
+    // for as long as the shell process does (see the big comment at the
+    // top of this file), which can outlive any single component instance —
+    // so instead of the link-click handlers below closing over a `workspace`
+    // that could go stale after a tab switch/remount, they read it fresh
+    // off this field each time (kept up to date by TerminalPane's render
+    // effect further down).
+    workspace: null,
   };
   sessions.set(tabId, session);
+
+  // Recognizes web links (e.g. "https://example.com") printed in the
+  // terminal's output, underlines them, and opens them in the in-app
+  // browser when clicked. Uses the addon's own default URL-matching rules
+  // (and its built-in "must be a real URL" filter, which is correct here).
+  const urlLinks = new WebLinksAddon((_event, uri) => openUrlLink(session, uri));
+  term.loadAddon(urlLinks);
+
+  // Recognizes file paths printed as plain text (see filePathLinks.js for
+  // why this is a custom provider instead of a second WebLinksAddon). The
+  // provider reads `session` live via getSession so it always sees the
+  // current workspace/cwd, even after this tab has been remounted.
+  const filePathProvider = createFilePathLinkProvider(() => sessions.get(tabId));
+  // registerLinkProvider returns a small "disposable" handle; xterm cleans
+  // it up automatically when the terminal itself is disposed, so we don't
+  // need to hold onto it ourselves.
+  term.registerLinkProvider(filePathProvider);
 
   // Whenever the user types something into the on-screen terminal, send
   // those exact keystrokes to the real background shell process.
@@ -358,6 +467,18 @@ export default function TerminalPane({ tab, workspace }) {
   // gets plugged in.
   const containerRef = useRef(null);
 
+  // Keeps this tab's session pointed at the LATEST `workspace` object on
+  // every single render (deliberately with no dependency array, so this
+  // runs after every render, not just the first one). This is what the
+  // link-click handlers (openUrlLink/openFileLink above) read from — see
+  // the big comment on the session's `workspace` field for why a one-time
+  // assignment wouldn't be enough (this component can unmount/remount
+  // while the session itself lives on).
+  useEffect(() => {
+    const session = sessions.get(tab.id);
+    if (session) session.workspace = workspace;
+  });
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return undefined;
@@ -377,6 +498,11 @@ export default function TerminalPane({ tab, workspace }) {
       // kept receiving output the whole time it was hidden.
       container.appendChild(session.host);
       session.mounted = true;
+      // Point the session at the CURRENT workspace object right away (not
+      // only on a later re-render). Link-click handlers read this field to
+      // open files/URLs in the right pane; if we left it stale/null, a
+      // click would silently do nothing.
+      session.workspace = workspace;
       // The pane may be a different size than when we left; refit once the
       // layout has settled.
       requestAnimationFrame(() => {
@@ -406,6 +532,12 @@ export default function TerminalPane({ tab, workspace }) {
         }
       ).then((created) => {
         session = created;
+        // createSession finishes asynchronously — sometimes without any
+        // React state update that would re-run the "keep workspace fresh"
+        // effect above (e.g. reconnecting to a still-running shell). Stamp
+        // workspace on immediately so the very first link click already
+        // has somewhere to open the file/URL.
+        session.workspace = workspace;
         if (cancelled) {
           // The tab was hidden again before setup finished. The session
           // stays alive (its shell is running) — just record that it's not

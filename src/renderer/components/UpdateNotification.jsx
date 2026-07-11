@@ -12,7 +12,7 @@ const STATUS_LABELS = {
   available: 'Update available',
   'not-available': 'You’re up to date',
   progress: 'Downloading update…',
-  downloaded: 'Update ready to install',
+  downloaded: 'Update downloaded — restarting to install…',
   error: 'Update error',
 };
 
@@ -68,9 +68,11 @@ export default function UpdateNotification({ updater }) {
       </div>
 
       {/* Show a different action button depending on where we are in the
-          update process: "Download" once an update is found, "Install &
-          Restart" once it's downloaded, or "Check again" if the check
-          failed or found nothing new. */}
+          update process: "Update & Restart" once an update is found (one
+          click downloads it, then the app restarts itself automatically),
+          "Install & Restart" as a manual fallback if the automatic restart
+          didn't happen, or "Check again" if the check failed or found
+          nothing new. */}
       <div className="flex shrink-0 items-center gap-2">
         {status === 'available' && (
           <button
@@ -78,7 +80,7 @@ export default function UpdateNotification({ updater }) {
             onClick={download}
             className="rounded bg-danger px-2.5 py-1 text-[12px] font-medium text-white transition-colors hover:bg-danger/90"
           >
-            Download
+            Update & Restart
           </button>
         )}
         {status === 'downloaded' && (

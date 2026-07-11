@@ -395,6 +395,62 @@ export function useWorkspace(workspaceId) {
     [applyLayout]
   );
 
+  // Finds the id of a tab of a given type (e.g. 'editor' or 'browser')
+  // that's already open in a specific pane, if there is one. Used below to
+  // avoid piling up duplicate tabs when a Terminal pane's clickable link
+  // opens a file or URL — we'd rather reuse a tab that's already sitting
+  // right there than keep creating new ones.
+  const findTabIdOfTypeInPane = useCallback(
+    (paneId, type) => {
+      const pane = findPane(layoutRef.current, paneId);
+      if (!pane) return null;
+      return pane.tabIds.find((id) => tabsById.get(id)?.type === type) || null;
+    },
+    [tabsById]
+  );
+
+  // Opens a file for editing inside a specific pane — used by the Terminal
+  // pane's clickable-file-link feature (see TerminalPane.jsx). If that pane
+  // already has an editor tab open, this just points that SAME tab at the
+  // new file and switches to it, instead of opening a brand new tab every
+  // time a different file link is clicked. Only if the pane has no editor
+  // tab yet does this create one.
+  const openFileInPane = useCallback(
+    async (paneId, filePath) => {
+      const existingId = findTabIdOfTypeInPane(paneId, 'editor');
+      if (existingId) {
+        await updateTab(existingId, { config: { filePath } });
+        activateTab(existingId, paneId);
+        return existingId;
+      }
+      const fileName = filePath.split(/[\\/]/).pop() || filePath;
+      const tab = await createTab('editor', fileName, { filePath }, { paneId });
+      return tab?.id || null;
+    },
+    [findTabIdOfTypeInPane, updateTab, activateTab, createTab]
+  );
+
+  // Opens a URL inside a specific pane — used by the Terminal pane's
+  // clickable-URL-link feature. If that pane already has a browser tab
+  // open, the link is opened as a new page inside that SAME browser tab
+  // (browser tabs already have their own internal page-tab list — see
+  // BrowserPane.jsx), instead of creating a whole new workspace tab every
+  // time a different link is clicked. Only if the pane has no browser tab
+  // yet does this create one.
+  const openUrlInPane = useCallback(
+    async (paneId, url) => {
+      const existingId = findTabIdOfTypeInPane(paneId, 'browser');
+      if (existingId) {
+        window.browser.newTab(String(existingId), url);
+        activateTab(existingId, paneId);
+        return existingId;
+      }
+      const tab = await createTab('browser', url, { url }, { paneId });
+      return tab?.id || null;
+    },
+    [findTabIdOfTypeInPane, activateTab, createTab]
+  );
+
   // Marks a pane as the currently focused one (e.g. when you click inside
   // it) — see PaneContainer.jsx for where this gets called.
   const focusPane = useCallback((paneId) => {
@@ -487,5 +543,7 @@ export function useWorkspace(workspaceId) {
     focusPane,
     cycleTab,
     resizeSplit,
+    openFileInPane,
+    openUrlInPane,
   };
 }

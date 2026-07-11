@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Editor from '@monaco-editor/react';
-import { ChevronIcon, FileIcon, FolderIcon, PanelLeftIcon } from '../icons';
+import { ChevronIcon, FileIcon, FolderIcon, PanelLeftIcon, PlusIcon } from '../icons';
 import ImageViewer from './viewers/ImageViewer';
 import SpreadsheetViewer from './viewers/SpreadsheetViewer';
 import PdfViewer from './viewers/PdfViewer';
@@ -63,6 +63,18 @@ export default function EditorPane({ tab, workspace }) {
   // so browsing files never permanently steals width from the code. This
   // tracks whether that drawer is currently popped open.
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // The Explorer's open right-click menu, if any: where on screen to draw
+  // it, and which entry it's for (or null, meaning "the empty background,"
+  // which offers New File/New Folder at the workspace root instead of
+  // Rename/Delete).
+  const [contextMenu, setContextMenu] = useState(null); // { x, y, entry }
+  // The in-progress "type a name" row for creating a new file or folder,
+  // shown inline in the tree in place of a normal row, once "New
+  // File"/"New Folder" has been chosen but no name has been confirmed yet.
+  const [draft, setDraft] = useState(null); // { parentPath, isDirectory }
+  // The path of whichever file/folder is currently being renamed inline
+  // (via double-click, or "Rename" from the context menu), if any.
+  const [renamingPath, setRenamingPath] = useState(null);
 
   // Watch this pane's actual on-screen width and flip into "narrow" mode
   // once it drops below NARROW_BREAKPOINT — this is what makes the
@@ -118,6 +130,33 @@ export default function EditorPane({ tab, workspace }) {
   // handler below (see handleEditorDrop) can insert text at the cursor —
   // Monaco hands us this instance via the Editor component's onMount prop.
   const editorRef = useRef(null);
+
+  // Remembers the last file path this pane itself applied to `selectedFile`
+  // (whether that came from clicking a file in the Explorer, or from an
+  // outside request — see the effect below), so we can tell the difference
+  // between "this tab's saved config changed because WE opened a file" and
+  // "something else, outside of this pane, wants us to open a different
+  // file" — namely, clicking a file-path link in a Terminal pane sitting in
+  // the same split, which opens files by directly updating this tab's saved
+  // `filePath` (see useWorkspace.js's openFileInPane and
+  // TerminalPane.jsx's openFileLink).
+  const lastAppliedFilePath = useRef(tab.config?.filePath || null);
+
+  // Whenever this tab's saved `filePath` changes to something we didn't
+  // just set ourselves, switch the editor over to that file. Without this,
+  // an editor tab that was already open would just ignore a file link
+  // clicked in the terminal — clicking the file's path always updates the
+  // ALREADY-open editor tab's config (createTab only happens when there
+  // isn't one yet), but that update alone wouldn't do anything unless
+  // something is watching for it.
+  useEffect(() => {
+    const incoming = tab.config?.filePath || null;
+    if (incoming !== lastAppliedFilePath.current) {
+      lastAppliedFilePath.current = incoming;
+      setSelectedFile(incoming);
+      setDrawerOpen(false);
+    }
+  }, [tab.config?.filePath]);
 
   // Reads a folder's contents, and recursively pre-loads a couple of
   // levels of subfolders too (depth < 2), so expanding a folder in the
@@ -269,9 +308,137 @@ export default function EditorPane({ tab, workspace }) {
   // from it is the natural "I'm done with this drawer" signal, the same
   // way choosing an item from a mobile app's slide-out menu closes it.
   const openFile = (filePath) => {
+    lastAppliedFilePath.current = filePath;
     setSelectedFile(filePath);
     workspace.updateTab(tab.id, { config: { ...tab.config, filePath } });
     setDrawerOpen(false);
+  };
+
+  // Opens the Explorer's right-click menu at the mouse's position, for a
+  // given entry — or for `null`, meaning "the empty background," which is
+  // treated as "New File/New Folder should be created at the workspace
+  // root." Stops the event from bubbling further so that right-clicking a
+  // row doesn't ALSO trigger the tree container's own background handler.
+  const openContextMenu = (e, entry) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({ x: e.clientX, y: e.clientY, entry });
+  };
+
+  // Re-reads one folder's contents from disk and updates the Explorer tree
+  // to match — used after creating, renaming, or deleting something inside
+  // that folder, so the tree reflects what's really on disk right away,
+  // the same way toggleFolder's on-demand loading (above) does.
+  const reloadFolder = async (folderPath) => {
+    const children = await loadDir(folderPath);
+    if (folderPath === rootPath) {
+      setTree(children);
+      return;
+    }
+    const entry = findEntry(tree, folderPath);
+    if (entry) {
+      entry.children = children;
+      setTree((prevTree) => [...prevTree]);
+    }
+  };
+
+  // Makes sure a folder is expanded and its contents have been loaded —
+  // called before showing a "new file/folder" draft row inside it, so that
+  // row actually has somewhere on screen to appear.
+  const ensureExpanded = (folderPath) => {
+    if (folderPath === rootPath) return;
+    setExpanded((prev) => (prev.has(folderPath) ? prev : new Set(prev).add(folderPath)));
+    const entry = findEntry(tree, folderPath);
+    if (entry && entry.children === undefined) {
+      loadDir(folderPath).then((children) => {
+        entry.children = children;
+        setTree((prevTree) => [...prevTree]);
+      });
+    }
+  };
+
+  // Starts the inline "New File"/"New Folder" flow: closes the context
+  // menu, makes sure the target folder is visible/expanded, and shows the
+  // draft name-input row inside it.
+  const startCreate = (parentPath, isDirectory) => {
+    setContextMenu(null);
+    ensureExpanded(parentPath);
+    setDraft({ parentPath, isDirectory });
+  };
+
+  // Confirms the in-progress create-draft: asks the background process to
+  // actually make the file/folder on disk, then reloads that folder so the
+  // real new entry replaces the temporary draft row. An empty name (the
+  // user just clicked away without typing anything) or a name that
+  // collides with something already there simply cancels the draft — no
+  // error popup, since the Explorer's own display (nothing new appears)
+  // already makes it obvious nothing was created.
+  const confirmCreate = async (name) => {
+    const pending = draft;
+    setDraft(null);
+    const trimmed = name.trim();
+    if (!pending || !trimmed) return;
+    try {
+      const createdPath = pending.isDirectory
+        ? await window.fs.createFolder(pending.parentPath, trimmed)
+        : await window.fs.createFile(pending.parentPath, trimmed);
+      await reloadFolder(pending.parentPath);
+      if (!pending.isDirectory) openFile(createdPath);
+    } catch {
+      // Most likely something with that name already exists there —
+      // leave the Explorer as-is rather than showing a disruptive error.
+    }
+  };
+
+  // Starts the inline rename flow for an existing file or folder.
+  const startRename = (entry) => {
+    setContextMenu(null);
+    setRenamingPath(entry.path);
+  };
+
+  // Confirms an in-progress rename: asks the background process to
+  // actually rename the file/folder on disk, then reloads its PARENT
+  // folder so the tree shows the new name. If the renamed file happened to
+  // be the one open in the editor, keeps editing it under its new path
+  // instead of leaving the editor pointed at a path that no longer exists.
+  // An empty name, or one that's unchanged, simply cancels the rename.
+  const confirmRename = async (entry, name) => {
+    setRenamingPath(null);
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === entry.name) return;
+    const parentPath = entry.path.slice(0, entry.path.length - entry.name.length - 1) || rootPath;
+    try {
+      const newPath = await window.fs.rename(entry.path, trimmed);
+      await reloadFolder(parentPath);
+      if (selectedFile === entry.path) openFile(newPath);
+    } catch {
+      // Most likely a naming collision with something already there —
+      // leave things as they were.
+    }
+  };
+
+  // Permanently deletes a file or folder, after the browser's built-in
+  // confirm() dialog (so this destructive, unrecoverable action always
+  // requires an explicit "yes"), then reloads its parent folder. If the
+  // deleted item was open in the editor (or was a folder containing the
+  // open file), clears the editor rather than leaving it pointed at
+  // something that no longer exists.
+  const deleteEntry = async (entry) => {
+    setContextMenu(null);
+    const kind = entry.isDirectory ? 'folder' : 'file';
+    if (!window.confirm(`Delete this ${kind}?\n\n${entry.path}`)) return;
+    const parentPath = entry.path.slice(0, entry.path.length - entry.name.length - 1) || rootPath;
+    await window.fs.delete(entry.path);
+    await reloadFolder(parentPath);
+    const affectsOpenFile =
+      selectedFile === entry.path ||
+      (entry.isDirectory && selectedFile?.startsWith(`${entry.path}\\`)) ||
+      (entry.isDirectory && selectedFile?.startsWith(`${entry.path}/`));
+    if (affectsOpenFile) {
+      lastAppliedFilePath.current = null;
+      setSelectedFile(null);
+      workspace.updateTab(tab.id, { config: { ...tab.config, filePath: null } });
+    }
   };
 
   // Handles a URL dragged in from a Browser pane's address bar (see
@@ -298,7 +465,15 @@ export default function EditorPane({ tab, workspace }) {
   // appear below (docked in the sidebar column, or inside the floating
   // drawer) so both stay in sync automatically instead of drifting apart.
   const explorerTree = (
-    <div className="min-h-0 flex-1 overflow-y-auto py-1">
+    <div
+      className="min-h-0 flex-1 overflow-y-auto py-1"
+      // Right-clicking empty space below/between the rows (rather than a
+      // row itself) offers "New File"/"New Folder" at the workspace root.
+      // Individual rows call stopPropagation() in their own handler (see
+      // openContextMenu above), so this only fires for genuine background
+      // clicks.
+      onContextMenu={(e) => openContextMenu(e, null)}
+    >
       {tree.map((entry) => (
         <TreeNode
           key={entry.path}
@@ -308,8 +483,24 @@ export default function EditorPane({ tab, workspace }) {
           selectedFile={selectedFile}
           onToggle={toggleFolder}
           onSelect={openFile}
+          onContextMenu={openContextMenu}
+          onStartRename={startRename}
+          renamingPath={renamingPath}
+          onConfirmRename={confirmRename}
+          onCancelRename={() => setRenamingPath(null)}
+          draft={draft}
+          onConfirmCreate={confirmCreate}
+          onCancelCreate={() => setDraft(null)}
         />
       ))}
+      {draft?.parentPath === rootPath && (
+        <InlineNameInput
+          level={0}
+          isDirectory={draft.isDirectory}
+          onConfirm={confirmCreate}
+          onCancel={() => setDraft(null)}
+        />
+      )}
     </div>
   );
 
@@ -333,10 +524,29 @@ export default function EditorPane({ tab, workspace }) {
               Explorer
             </span>
           )}
+          {!narrow && explorerOpen && (
+            <button
+              type="button"
+              // Opens the SAME right-click menu used elsewhere in the
+              // Explorer, positioned just under this button, with no
+              // specific entry selected — which the menu treats as "create
+              // at the workspace root." This reuses one menu component
+              // instead of building a separate dropdown just for this
+              // button.
+              onClick={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                setContextMenu({ x: rect.left, y: rect.bottom + 4, entry: null });
+              }}
+              className="ml-auto flex h-6 w-6 shrink-0 items-center justify-center rounded text-ink-dim hover:bg-hover hover:text-ink"
+              title="New file or folder"
+            >
+              <PlusIcon />
+            </button>
+          )}
           <button
             type="button"
             onClick={toggleExplorer}
-            className={`ml-auto flex h-6 w-6 shrink-0 items-center justify-center rounded text-ink-dim hover:bg-hover hover:text-ink ${
+            className={`${!narrow && explorerOpen ? '' : 'ml-auto'} flex h-6 w-6 shrink-0 items-center justify-center rounded text-ink-dim hover:bg-hover hover:text-ink ${
               drawerOpen ? 'bg-hover text-ink' : ''
             }`}
             title={narrow || !explorerOpen ? 'Show file explorer' : 'Hide file explorer'}
@@ -359,12 +569,38 @@ export default function EditorPane({ tab, workspace }) {
             onClick={() => setDrawerOpen(false)}
           />
           <div className="absolute inset-y-0 left-0 z-20 flex w-56 max-w-[75%] flex-col border-r border-edge bg-surface shadow-lg">
-            <div className="flex h-8 shrink-0 items-center border-b border-edge px-3 text-[11px] font-medium uppercase tracking-wide text-ink-dim">
+            <div className="flex h-8 shrink-0 items-center justify-between border-b border-edge px-3 text-[11px] font-medium uppercase tracking-wide text-ink-dim">
               Explorer
+              <button
+                type="button"
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setContextMenu({ x: rect.left, y: rect.bottom + 4, entry: null });
+                }}
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-ink-dim normal-case tracking-normal hover:bg-hover hover:text-ink"
+                title="New file or folder"
+              >
+                <PlusIcon />
+              </button>
             </div>
             {explorerTree}
           </div>
         </>
+      )}
+
+      {/* The Explorer's right-click menu (New File/New Folder on a folder
+          or the empty background, Rename/Delete on an existing entry). See
+          ExplorerContextMenu below. */}
+      {contextMenu && (
+        <ExplorerContextMenu
+          menu={contextMenu}
+          rootPath={rootPath}
+          onClose={() => setContextMenu(null)}
+          onNewFile={(parentPath) => startCreate(parentPath, false)}
+          onNewFolder={(parentPath) => startCreate(parentPath, true)}
+          onRename={startRename}
+          onDelete={deleteEntry}
+        />
       )}
 
       {/* Right side: whichever viewer fits the selected file (code editor,
@@ -448,27 +684,65 @@ export default function EditorPane({ tab, workspace }) {
 // be expanded/collapsed to reveal its children) or a plain file (which
 // opens it in the editor when clicked). This function calls itself
 // recursively to draw nested subfolders.
-function TreeNode({ entry, level, expanded, selectedFile, onToggle, onSelect }) {
+//
+// Besides its normal display, a row can also be swapped out for an inline
+// text input in two situations: it's the one currently being renamed
+// (renamingPath === entry.path, via double-click or the context menu's
+// "Rename"), or — for folders only — it currently has a "new file/folder"
+// draft row waiting inside it (draft.parentPath === entry.path, via the
+// context menu's "New File"/"New Folder"). See InlineNameInput below.
+function TreeNode({
+  entry,
+  level,
+  expanded,
+  selectedFile,
+  onToggle,
+  onSelect,
+  onContextMenu,
+  onStartRename,
+  renamingPath,
+  onConfirmRename,
+  onCancelRename,
+  draft,
+  onConfirmCreate,
+  onCancelCreate,
+}) {
   const isExpanded = expanded.has(entry.path);
+  const isRenaming = renamingPath === entry.path;
 
   if (entry.isDirectory) {
     return (
       <div>
-        <button
-          type="button"
-          onClick={() => onToggle(entry.path)}
-          className="flex w-full items-center gap-1 px-2 py-0.5 text-left text-[12px] text-ink hover:bg-hover"
-          // Indents each nested level further to the right, so the tree
-          // visually shows how deeply nested each folder/file is — the
-          // same visual convention as any file browser's tree view.
-          style={{ paddingLeft: `${level * 12 + 8}px` }}
-        >
-          <ChevronIcon
-            className={`shrink-0 transition-transform ${isExpanded ? 'rotate-90' : 'rotate-0'}`}
+        {isRenaming ? (
+          <InlineNameInput
+            level={level}
+            isDirectory
+            initialValue={entry.name}
+            onConfirm={(name) => onConfirmRename(entry, name)}
+            onCancel={onCancelRename}
           />
-          <FolderIcon />
-          <span className="truncate">{entry.name}</span>
-        </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => onToggle(entry.path)}
+            onContextMenu={(e) => onContextMenu(e, entry)}
+            onDoubleClick={(e) => {
+              e.stopPropagation();
+              onStartRename(entry);
+            }}
+            className="flex w-full items-center gap-1 px-2 py-0.5 text-left text-[12px] text-ink hover:bg-hover"
+            // Indents each nested level further to the right, so the tree
+            // visually shows how deeply nested each folder/file is — the
+            // same visual convention as any file browser's tree view.
+            style={{ paddingLeft: `${level * 12 + 8}px` }}
+          >
+            <ChevronIcon
+              className={`shrink-0 transition-transform ${isExpanded ? 'rotate-90' : 'rotate-0'}`}
+            />
+            <FolderIcon />
+            <span className="truncate">{entry.name}</span>
+          </button>
+        )}
         {isExpanded && (
           <div>
             {entry.children?.map((child) => (
@@ -480,11 +754,39 @@ function TreeNode({ entry, level, expanded, selectedFile, onToggle, onSelect }) 
                 selectedFile={selectedFile}
                 onToggle={onToggle}
                 onSelect={onSelect}
+                onContextMenu={onContextMenu}
+                onStartRename={onStartRename}
+                renamingPath={renamingPath}
+                onConfirmRename={onConfirmRename}
+                onCancelRename={onCancelRename}
+                draft={draft}
+                onConfirmCreate={onConfirmCreate}
+                onCancelCreate={onCancelCreate}
               />
             ))}
+            {draft?.parentPath === entry.path && (
+              <InlineNameInput
+                level={level + 1}
+                isDirectory={draft.isDirectory}
+                onConfirm={onConfirmCreate}
+                onCancel={onCancelCreate}
+              />
+            )}
           </div>
         )}
       </div>
+    );
+  }
+
+  if (isRenaming) {
+    return (
+      <InlineNameInput
+        level={level}
+        isDirectory={false}
+        initialValue={entry.name}
+        onConfirm={(name) => onConfirmRename(entry, name)}
+        onCancel={onCancelRename}
+      />
     );
   }
 
@@ -492,6 +794,11 @@ function TreeNode({ entry, level, expanded, selectedFile, onToggle, onSelect }) 
     <button
       type="button"
       onClick={() => onSelect(entry.path)}
+      onContextMenu={(e) => onContextMenu(e, entry)}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        onStartRename(entry);
+      }}
       // Lets you drag this file out of the Explorer and drop it onto a
       // Terminal pane to insert its path — see TerminalPane.jsx's onDrop.
       // "text/plain" is the one data type every drop target can read.
@@ -508,6 +815,149 @@ function TreeNode({ entry, level, expanded, selectedFile, onToggle, onSelect }) 
       <FileIcon />
       <span className="truncate">{entry.name}</span>
     </button>
+  );
+}
+
+// A single-line text box that swaps in wherever a normal tree row would go,
+// used both for typing a brand-new file/folder's name (a "draft" row with
+// no initialValue) and for renaming an existing one (pre-filled with its
+// current name). Confirms on Enter or on losing focus (clicking away),
+// cancels on Escape — matching how most file browsers' inline rename works.
+function InlineNameInput({ level, isDirectory, initialValue = '', onConfirm, onCancel }) {
+  const [value, setValue] = useState(initialValue);
+  const inputRef = useRef(null);
+  // Guards against both onKeyDown AND onBlur firing for the same
+  // keystroke: pressing Escape removes this input from the page, and
+  // browsers fire a "blur" event the instant a focused element is removed
+  // — without this guard, that blur would immediately re-trigger onConfirm
+  // right after onCancel already ran.
+  const settledRef = useRef(false);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+
+  const confirm = () => {
+    if (settledRef.current) return;
+    settledRef.current = true;
+    onConfirm(value);
+  };
+  const cancel = () => {
+    if (settledRef.current) return;
+    settledRef.current = true;
+    onCancel();
+  };
+
+  return (
+    <div
+      className="flex items-center gap-1 px-2 py-0.5"
+      style={{ paddingLeft: `${level * 12 + (isDirectory ? 8 : 24)}px` }}
+    >
+      {isDirectory ? <FolderIcon /> : <FileIcon />}
+      <input
+        ref={inputRef}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            confirm();
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            cancel();
+          }
+        }}
+        onBlur={confirm}
+        className="w-full min-w-0 rounded border border-edge bg-app px-1 py-px text-[12px] text-ink focus:outline-none"
+      />
+    </div>
+  );
+}
+
+// The Explorer's right-click menu. Right-clicking an existing FILE offers
+// Rename/Delete only (you can't put something "inside" a file). Right-
+// clicking a FOLDER, or the empty background (entry === null, standing for
+// "the workspace root"), also offers New File/New Folder, created inside
+// that folder (or the root). Modeled on TabBar.jsx's TabContextMenu — same
+// fixed-position-with-dismiss-overlay, viewport-clamping, Escape-to-close
+// pattern, just for a different part of the app.
+function ExplorerContextMenu({ menu, rootPath, onClose, onNewFile, onNewFolder, onRename, onDelete }) {
+  const ref = useRef(null);
+  const [pos, setPos] = useState({ x: menu.x, y: menu.y });
+
+  // Keep the menu on-screen — if it was about to open partly off the edge
+  // of the window, nudge its position back so the whole menu stays
+  // visible instead of getting cut off.
+  useEffect(() => {
+    if (!ref.current) return;
+    const rect = ref.current.getBoundingClientRect();
+    setPos({
+      x: Math.min(menu.x, window.innerWidth - rect.width - 4),
+      y: Math.min(menu.y, window.innerHeight - rect.height - 4),
+    });
+  }, [menu]);
+
+  // Pressing Escape closes the menu, matching standard menu behavior.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  // Wraps a menu action so that clicking any item both closes the menu AND
+  // runs the action, instead of having to remember to do both every time.
+  const run = (fn) => () => {
+    onClose();
+    fn();
+  };
+
+  const { entry } = menu;
+  const targetFolder = entry ? (entry.isDirectory ? entry.path : null) : rootPath;
+  const items = [
+    targetFolder && { label: 'New File', action: run(() => onNewFile(targetFolder)) },
+    targetFolder && { label: 'New Folder', action: run(() => onNewFolder(targetFolder)) },
+    entry && { divider: true },
+    entry && { label: 'Rename', action: run(() => onRename(entry)) },
+    entry && { label: 'Delete', action: run(() => onDelete(entry)) },
+  ].filter(Boolean);
+
+  return (
+    <>
+      {/* An invisible full-screen overlay that closes the menu when you
+          click (or right-click) anywhere outside of it. */}
+      <div
+        className="fixed inset-0 z-30"
+        onClick={onClose}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onClose();
+        }}
+      />
+      <div
+        ref={ref}
+        style={{ left: pos.x, top: pos.y }}
+        className="fixed z-40 min-w-[150px] rounded-md border border-edge bg-surface py-1 shadow-lg"
+      >
+        {items.map((item, i) =>
+          item.divider ? (
+            <div key={i} className="my-1 border-t border-edge" />
+          ) : (
+            <button
+              key={item.label}
+              type="button"
+              onClick={item.action}
+              className="flex w-full items-center px-3 py-1.5 text-left text-[12px] text-ink hover:bg-hover"
+            >
+              {item.label}
+            </button>
+          )
+        )}
+      </div>
+    </>
   );
 }
 

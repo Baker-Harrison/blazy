@@ -140,6 +140,23 @@ contextBridge.exposeInMainWorld('fs', {
   // text. Used for file types where reading as text would corrupt the
   // data — images, .xlsx spreadsheets, PDFs, etc. See files.js.
   readFileBinary: (filePath) => ipcRenderer.invoke('fs:readFileBinary', filePath),
+  // Checks whether a file or folder exists at this path, without reading
+  // it. Used by the Terminal pane to confirm a piece of printed text is a
+  // real file before turning it into a clickable link.
+  exists: (targetPath) => ipcRenderer.invoke('fs:exists', targetPath),
+  // The current user's home folder path (e.g. "C:\Users\you") — used by the
+  // Terminal pane to expand a "~/..." link into a real path. See files.js.
+  homeDir: () => ipcRenderer.invoke('fs:homeDir'),
+  // The four Explorer "right-click menu" actions: making a new empty file,
+  // making a new empty folder, renaming (or moving) something, and
+  // permanently deleting something. See files.js for the safety details of
+  // each (e.g. New File refuses to overwrite an existing file).
+  createFile: (parentPath, name) => ipcRenderer.invoke('fs:createFile', parentPath, name),
+  createFolder: (parentPath, name) => ipcRenderer.invoke('fs:createFolder', parentPath, name),
+  // Renames something to a new NAME (not a whole new path) — see files.js's
+  // renamePath for why. Resolves to the item's full new path.
+  rename: (oldPath, newName) => ipcRenderer.invoke('fs:rename', oldPath, newName),
+  delete: (targetPath) => ipcRenderer.invoke('fs:delete', targetPath),
 });
 
 // Auto-update controls (check for a new version, download it, install it),
