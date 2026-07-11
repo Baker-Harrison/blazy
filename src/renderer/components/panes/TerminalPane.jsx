@@ -167,6 +167,12 @@ async function createSession(tabId, host, savedTerminalId, cwd, onNewTerminalId)
     // things that made terminals look scrambled before.
     convertEol: false,
     allowTransparency: false,
+    // The Unicode11 addon below (which teaches the terminal correct
+    // character-width rules) uses a feature of xterm.js that is still
+    // labeled "experimental" upstream. xterm.js refuses to let any
+    // experimental feature run unless we explicitly opt in here — without
+    // this flag, the terminal pane throws immediately and never renders.
+    allowProposedApi: true,
     scrollback: 5000, // How many lines of history you can scroll back through.
     // On Windows, the real shell process talks to us through "ConPTY"
     // (Windows' terminal emulation layer), which sometimes splits a
