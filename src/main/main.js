@@ -5,7 +5,7 @@
 // the app's control room: it doesn't draw anything on screen itself, but it
 // sets up everything the on-screen UI will need.
 
-const { app, BrowserWindow, Menu, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, dialog, clipboard } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const db = require('./db');
@@ -90,6 +90,15 @@ function registerWindowHandlers() {
   ipcMain.on('window:close', (e) => BrowserWindow.fromWebContents(e.sender)?.close());
 }
 
+// Registers the system clipboard read/write channels used by the Terminal
+// pane's copy/paste shortcuts (see terminalClipboard.js). The renderer
+// can't touch the OS clipboard directly (see preload.js's comment on why),
+// so this is a thin pass-through to Electron's own clipboard module.
+function registerClipboardHandlers() {
+  ipcMain.handle('clipboard:readText', () => clipboard.readText());
+  ipcMain.handle('clipboard:writeText', (_e, text) => clipboard.writeText(text));
+}
+
 // Keeps a reference to the app's single main window so other parts of the
 // app (like the updater) can send it messages.
 let mainWindow = null;
@@ -157,6 +166,7 @@ app.whenReady().then(async () => {
   registerDbHandlers();
   registerFolderHandlers();
   registerWindowHandlers();
+  registerClipboardHandlers();
   registerTerminalHandlers();
   registerFileHandlers();
   registerBrowserHandlers(() => mainWindow);

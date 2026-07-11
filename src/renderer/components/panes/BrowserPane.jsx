@@ -163,7 +163,46 @@ export default function BrowserPane({ tab, workspace }) {
   // user's own railExpanded preference above, which is left untouched so
   // widening the pane back out restores exactly what they had before.
   const [narrow, setNarrow] = useState(false);
-  const showExpandedRail = railExpanded && !narrow;
+  // Whether the mouse is currently hovering the tab rail, temporarily
+  // showing it expanded even when the user has it pinned collapsed — the
+  // same auto-hide behavior as Arc/Edge's vertical tab strip. This is
+  // layered on top of railExpanded/narrow below rather than replacing them:
+  // hovering only ever opens an already-collapsed rail, it never collapses
+  // one the user has deliberately pinned open.
+  const [hoverOpen, setHoverOpen] = useState(false);
+  // Collapsing back down is delayed a bit after the mouse actually leaves
+  // (see handleRailMouseLeave), so a quick flick across the rail's edge
+  // doesn't make it flicker shut and reopen. Expanding on the way in has no
+  // such delay — that should feel instant.
+  const collapseTimer = useRef(null);
+  // What the user has actually pinned, ignoring hover — used for the
+  // toggle button's own label/icon below, so hovering never makes that
+  // button lie about what clicking it will do.
+  const pinnedExpanded = railExpanded && !narrow;
+  const showExpandedRail = pinnedExpanded || hoverOpen;
+
+  const handleRailMouseEnter = () => {
+    if (collapseTimer.current) {
+      clearTimeout(collapseTimer.current);
+      collapseTimer.current = null;
+    }
+    setHoverOpen(true);
+  };
+  const handleRailMouseLeave = () => {
+    if (collapseTimer.current) clearTimeout(collapseTimer.current);
+    collapseTimer.current = setTimeout(() => {
+      collapseTimer.current = null;
+      setHoverOpen(false);
+    }, 200);
+  };
+  // Don't leave a pending collapse timer running after the pane itself is
+  // torn down (e.g. the tab was closed while the mouse happened to be
+  // hovering the rail).
+  useEffect(() => {
+    return () => {
+      if (collapseTimer.current) clearTimeout(collapseTimer.current);
+    };
+  }, []);
   // A reference to the empty "page area" div — its on-screen position and
   // size is measured continuously and reported to the background process,
   // so it knows exactly where to draw the real webpage.
@@ -258,6 +297,34 @@ export default function BrowserPane({ tab, workspace }) {
   useEffect(() => {
     let raf;
     lastRect.current = null;
+    // Every intermediate frame of a CSS transition anywhere in this pane's
+    // ancestry — the vertical tab rail expanding/collapsing on hover, the
+    // app's own sidebar sliding open, a split divider being dragged — used
+    // to get forwarded to the background process as a real resize of the
+    // native page the instant it was measured. A single ~150ms transition
+    // fires ~10 of those in a row, and each one immediately repaints the
+    // real native browser view at that in-between size — which is exactly
+    // what a captured diagnostic log showed happening: a freshly-opened
+    // browser pane's content area rapidly resizing back and forth as the
+    // tab rail flickered open and shut while the mouse merely passed near
+    // it, leaving the actual page visibly mis-sized (scrollbar, cut-off
+    // content) until everything stopped moving.
+    //
+    // The fix mirrors the same debounce already used for terminal resizing
+    // in TerminalPane.jsx: instead of reporting every measured change
+    // immediately, we wait for the rect to stop changing for a short
+    // stretch (SETTLE_MS) before reporting it — so a transition produces
+    // exactly one clean resize once it's actually done, not a dozen
+    // mid-flight ones.
+    const SETTLE_MS = 80;
+    let settleTimer = null;
+    let pendingRect = null;
+    const rectsMatch = (a, b) =>
+      a.visible === b.visible &&
+      Math.abs(a.x - b.x) <= 0.5 &&
+      Math.abs(a.y - b.y) <= 0.5 &&
+      Math.abs(a.width - b.width) <= 0.5 &&
+      Math.abs(a.height - b.height) <= 0.5;
     const tick = () => {
       const el = contentRef.current;
       if (el) {
@@ -269,30 +336,35 @@ export default function BrowserPane({ tab, workspace }) {
           r.height > 0 &&
           el.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true });
         const rect = { x: r.x, y: r.y, width: r.width, height: r.height, visible };
-        const prev = lastRect.current;
-        // Only send an update if visibility changed, or the position/size
-        // moved by more than half a pixel (a small threshold to ignore
-        // meaningless sub-pixel rounding noise).
-        if (
-          !prev ||
-          prev.visible !== visible ||
-          Math.abs(prev.x - rect.x) > 0.5 ||
-          Math.abs(prev.y - rect.y) > 0.5 ||
-          Math.abs(prev.width - rect.width) > 0.5 ||
-          Math.abs(prev.height - rect.height) > 0.5
-        ) {
-          lastRect.current = rect;
-          window.browser.setViewport(
-            paneId,
-            { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-            visible
-          );
+        // Compare against whatever we're currently waiting to settle (if a
+        // change is already pending) or the last thing we actually sent —
+        // so a further change while still waiting resets the debounce
+        // instead of racing against a stale comparison point.
+        const reference = pendingRect || lastRect.current;
+        if (!reference || !rectsMatch(reference, rect)) {
+          pendingRect = rect;
+          if (settleTimer) clearTimeout(settleTimer);
+          settleTimer = setTimeout(() => {
+            settleTimer = null;
+            const settledRect = pendingRect;
+            pendingRect = null;
+            if (!settledRect) return;
+            lastRect.current = settledRect;
+            window.browser.setViewport(
+              paneId,
+              { x: settledRect.x, y: settledRect.y, width: settledRect.width, height: settledRect.height },
+              settledRect.visible
+            );
+          }, SETTLE_MS);
         }
       }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+    return () => {
+      cancelAnimationFrame(raf);
+      if (settleTimer) clearTimeout(settleTimer);
+    };
   }, [paneId]);
 
   // --- Reflect active tab in the address bar (unless the user is typing).
@@ -422,7 +494,21 @@ export default function BrowserPane({ tab, workspace }) {
         </div>
 
         <div className="flex h-[26px] min-w-0 flex-1 items-center gap-1.5 rounded-md border border-edge bg-surface px-2 transition-colors duration-100 focus-within:border-ink-dim">
-          <span className={`shrink-0 ${isSecure ? 'text-green-400' : 'text-ink-dim'}`}>
+          {/* The little lock/globe icon doubles as a drag handle for the
+              current page's URL — the same convention real browsers use.
+              Drag it onto an Editor pane to drop in a markdown link, the
+              same way you'd drag a URL out of Chrome's address bar. */}
+          <span
+            draggable={!!activeTab?.url}
+            onDragStart={(e) => {
+              if (!activeTab?.url) return;
+              e.dataTransfer.setData('text/uri-list', activeTab.url);
+              e.dataTransfer.setData('text/plain', activeTab.url);
+              e.dataTransfer.setData('text/x-blazy-title', activeTab.title || '');
+              e.dataTransfer.effectAllowed = 'copy';
+            }}
+            className={`shrink-0 cursor-grab ${isSecure ? 'text-green-400' : 'text-ink-dim'}`}
+          >
             {isSecure ? <LockIcon /> : <GlobeIcon />}
           </span>
           <input
@@ -460,9 +546,9 @@ export default function BrowserPane({ tab, workspace }) {
           // button's own on/off preference (see showExpandedRail above) —
           // the label reflects that, so it doesn't claim an action it
           // can't actually perform right now.
-          title={narrow ? 'Not enough room to expand the tab rail' : showExpandedRail ? 'Collapse tab rail' : 'Expand tab rail'}
+          title={narrow ? 'Not enough room to expand the tab rail' : pinnedExpanded ? 'Collapse tab rail' : 'Expand tab rail'}
         >
-          <RailToggleIcon expanded={showExpandedRail} />
+          <RailToggleIcon expanded={pinnedExpanded} />
         </button>
 
         {/* Thin accent loading line, flush with the bottom of the chrome row. */}
@@ -474,8 +560,12 @@ export default function BrowserPane({ tab, workspace }) {
       </form>
 
       <div className="flex min-h-0 min-w-0 flex-1">
-        {/* Vertical tab rail */}
+        {/* Vertical tab rail — hovering it temporarily expands it even when
+            pinned collapsed (see hoverOpen above); leaving collapses it back
+            down after a short delay so it doesn't flicker. */}
         <div
+          onMouseEnter={handleRailMouseEnter}
+          onMouseLeave={handleRailMouseLeave}
           className={`flex shrink-0 flex-col gap-0.5 overflow-y-auto overflow-x-hidden py-1 pl-1.5 pr-1 transition-[width] duration-150 [scrollbar-width:none] ${
             showExpandedRail ? 'w-[188px]' : 'w-[40px]'
           }`}

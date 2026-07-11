@@ -53,6 +53,16 @@ contextBridge.exposeInMainWorld('dialogs', {
   openFolder: () => ipcRenderer.invoke('dialog:openFolder'),
 });
 
+// The operating system's clipboard (the same one every other app on your
+// computer copies/pastes through). The on-screen UI can't reach this
+// directly — same reason as everything else in this file — so this just
+// forwards read/write requests to the background process. Used by the
+// Terminal pane's Ctrl+C/Ctrl+V handling (see terminalClipboard.js).
+contextBridge.exposeInMainWorld('clipboard', {
+  readText: () => ipcRenderer.invoke('clipboard:readText'),
+  writeText: (text) => ipcRenderer.invoke('clipboard:writeText', text),
+});
+
 // Everything needed to run a Terminal pane: creating a shell process,
 // re-attaching to an already-running one, sending it keystrokes, resizing
 // it, and closing it. See terminal.js for the background-process side of

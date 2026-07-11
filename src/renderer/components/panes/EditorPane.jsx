@@ -4,6 +4,7 @@ import { ChevronIcon, FileIcon, FolderIcon, PanelLeftIcon } from '../icons';
 import ImageViewer from './viewers/ImageViewer';
 import SpreadsheetViewer from './viewers/SpreadsheetViewer';
 import PdfViewer from './viewers/PdfViewer';
+import { markdownLinkForDrop } from '../../lib/dragPaste';
 
 // The code Editor pane: a mini file browser (the "Explorer" panel) on the
 // left, showing the folders/files inside the current workspace, and the
@@ -100,6 +101,10 @@ export default function EditorPane({ tab, workspace }) {
   // of silently throwing the edit away — otherwise the on-disk file would
   // be missing whatever was typed in the last 250ms.
   const pendingWrite = useRef(null);
+  // Holds the live Monaco editor instance once it's mounted, so the drop
+  // handler below (see handleEditorDrop) can insert text at the cursor —
+  // Monaco hands us this instance via the Editor component's onMount prop.
+  const editorRef = useRef(null);
 
   // Reads a folder's contents, and recursively pre-loads a couple of
   // levels of subfolders too (depth < 2), so expanding a folder in the
@@ -240,6 +245,26 @@ export default function EditorPane({ tab, workspace }) {
     setDrawerOpen(false);
   };
 
+  // Handles a URL dragged in from a Browser pane's address bar (see
+  // BrowserPane.jsx's draggable address-bar icon) and dropped anywhere on
+  // this Editor pane: turns it into a markdown link and types it into the
+  // editor at the current cursor position, the same as if the user had
+  // typed it themselves.
+  const handleEditorDrop = (e) => {
+    e.preventDefault();
+    const url = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain');
+    if (!url || !/^https?:\/\//i.test(url)) return; // Not a URL — nothing for us to do (e.g. a file drop, handled elsewhere).
+    const title = e.dataTransfer.getData('text/x-blazy-title');
+    const markdown = markdownLinkForDrop({ url, title });
+    const editor = editorRef.current;
+    if (!editor) return;
+    // "trigger keyboard type" inserts text exactly as if it had been typed
+    // at the current cursor position — including replacing any selection,
+    // just like a real paste would.
+    editor.trigger('keyboard', 'type', { text: markdown });
+    editor.focus();
+  };
+
   // The actual file/folder tree, shared between the two places it can
   // appear below (docked in the sidebar column, or inside the floating
   // drawer) so both stay in sync automatically instead of drifting apart.
@@ -316,7 +341,11 @@ export default function EditorPane({ tab, workspace }) {
       {/* Right side: whichever viewer fits the selected file (code editor,
           image, spreadsheet, PDF), or a placeholder message if nothing is
           selected yet. */}
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div
+        className="flex min-w-0 flex-1 flex-col"
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={handleEditorDrop}
+      >
         {selectedFile ? (
           <>
             <div className="flex h-8 shrink-0 items-center justify-between border-b border-edge px-3">
@@ -336,6 +365,9 @@ export default function EditorPane({ tab, workspace }) {
                   // etc. differently) — see languageForPath below.
                   defaultLanguage={languageForPath(selectedFile)}
                   value={content}
+                  onMount={(editor) => {
+                    editorRef.current = editor;
+                  }}
                   onChange={(value) => {
                     const nextContent = value || '';
                     setContent(nextContent);
@@ -431,6 +463,14 @@ function TreeNode({ entry, level, expanded, selectedFile, onToggle, onSelect }) 
     <button
       type="button"
       onClick={() => onSelect(entry.path)}
+      // Lets you drag this file out of the Explorer and drop it onto a
+      // Terminal pane to insert its path — see TerminalPane.jsx's onDrop.
+      // "text/plain" is the one data type every drop target can read.
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.setData('text/plain', entry.path);
+        e.dataTransfer.effectAllowed = 'copy';
+      }}
       className={`flex w-full items-center gap-1 px-2 py-0.5 text-left text-[12px] hover:bg-hover ${
         selectedFile === entry.path ? 'bg-hover text-white' : 'text-ink-dim'
       }`}

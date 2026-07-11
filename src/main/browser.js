@@ -1,4 +1,4 @@
-const { WebContentsView, Menu, clipboard, ipcMain, session } = require('electron');
+const { WebContentsView, Menu, clipboard, ipcMain, session, net } = require('electron');
 
 // Real browser engine for BrowserPane: one WebContentsView per browser tab,
 // grouped per pane (a pane = one Blazy workspace tab of type 'browser').
@@ -63,6 +63,39 @@ function errorPage(url, description) {
   );
 }
 
+// The page's own <img src="..."> can't be handed straight to the on-screen
+// tab strip: the app's Content-Security-Policy only allows images from
+// "self", "data:", and "blob:" sources (to keep a rogue web page from
+// loading tracking pixels or other junk into the app's own UI), which
+// blocks a plain "https://example.com/favicon.ico" URL. Since the CSP only
+// applies to the on-screen page itself and not to the background process,
+// we fetch the favicon HERE instead and hand the renderer a "data:" URI
+// (the raw image bytes, inlined right into the URL) — a form the CSP
+// already allows through. Cached by URL since most tabs on the same site
+// share one favicon, so we don't re-fetch it for every tab.
+const faviconCache = new Map(); // faviconUrl -> data: URI (or null if it failed)
+const MAX_FAVICON_BYTES = 200_000; // Generous for an icon; guards against something misbehaving.
+
+async function fetchFaviconDataUri(url) {
+  if (faviconCache.has(url)) return faviconCache.get(url);
+  let result = null;
+  try {
+    const response = await net.fetch(url);
+    if (response.ok) {
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length > 0 && buffer.length <= MAX_FAVICON_BYTES) {
+        const contentType = response.headers.get('content-type') || 'image/x-icon';
+        result = `data:${contentType};base64,${buffer.toString('base64')}`;
+      }
+    }
+  } catch {
+    // Network hiccup, blocked scheme, whatever — just show the fallback
+    // globe icon instead of a broken image.
+  }
+  faviconCache.set(url, result);
+  return result;
+}
+
 function attachViewEvents(paneId, tab) {
   const wc = tab.view.webContents;
   const update = (patch) => {
@@ -82,7 +115,14 @@ function attachViewEvents(paneId, tab) {
   wc.on('did-navigate', onNav);
   wc.on('did-navigate-in-page', onNav);
   wc.on('page-title-updated', (_e, title) => update({ title }));
-  wc.on('page-favicon-updated', (_e, favicons) => update({ favicon: favicons[0] || null }));
+  wc.on('page-favicon-updated', (_e, favicons) => {
+    const url = favicons[0] || null;
+    if (!url) {
+      update({ favicon: null });
+      return;
+    }
+    fetchFaviconDataUri(url).then((dataUri) => update({ favicon: dataUri }));
+  });
   wc.on('audio-state-changed', (e) => update({ audible: e.audible }));
   wc.on('render-process-gone', () => update({ crashed: true, loading: false }));
   wc.on('did-fail-load', (_e, code, description, url, isMainFrame) => {

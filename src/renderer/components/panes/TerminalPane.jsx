@@ -4,6 +4,8 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
+import { pathForTerminalDrop } from '../../lib/dragPaste';
+import { handleTerminalKeyEvent } from '../../lib/terminalClipboard';
 
 // "xterm.js" is a library that draws a fully working terminal screen (with
 // a blinking cursor, colored text, scrollback, etc.) inside a web page —
@@ -235,6 +237,24 @@ async function createSession(tabId, host, savedTerminalId, cwd, onNewTerminalId)
     if (session.termId && !session.dead) window.terminals.write(session.termId, data);
   });
 
+  // Smart copy/paste: Ctrl+C copies the current selection (and, since a
+  // selection exists, does NOT also send its usual SIGINT to the shell);
+  // with nothing selected, Ctrl+C is left completely alone and behaves
+  // exactly as it always has. Ctrl+V always pastes. See
+  // terminalClipboard.js for the actual decision policy — this just wires
+  // xterm's real selection/clipboard into it.
+  term.attachCustomKeyEventHandler((event) =>
+    handleTerminalKeyEvent(event, {
+      hasSelection: () => term.hasSelection(),
+      getSelection: () => term.getSelection(),
+      copyText: (text) => window.clipboard.writeText(text),
+      readClipboardText: () => window.clipboard.readText(),
+      pasteText: (text) => {
+        if (session.termId && !session.dead) window.terminals.write(session.termId, text);
+      },
+    })
+  );
+
   // Give the page one frame to lay the host div out at its real size, then
   // size the terminal to fill it — otherwise the very first size we'd
   // report to the shell would be the built-in default (80x24), not the
@@ -433,9 +453,24 @@ export default function TerminalPane({ tab, workspace }) {
     };
   }, [tab.id]);
 
+  // Handles a file dropped in from an Editor pane's Explorer (see
+  // EditorPane.jsx's draggable file rows), or a URL dropped in from a
+  // Browser pane's address bar: types the dropped path/URL into the shell
+  // at wherever its own cursor currently is, exactly like a paste.
+  const handleDrop = (e) => {
+    e.preventDefault();
+    const dropped = e.dataTransfer.getData('text/plain');
+    if (!dropped) return;
+    const session = sessions.get(tab.id);
+    if (!session || !session.termId || session.dead) return;
+    window.terminals.write(session.termId, pathForTerminalDrop(dropped));
+  };
+
   return (
     <div
       ref={containerRef}
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={handleDrop}
       className="terminal-pane h-full w-full min-h-0 min-w-0 flex-1 overflow-hidden bg-app"
     />
   );
