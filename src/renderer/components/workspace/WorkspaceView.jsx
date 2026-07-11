@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useWorkspace } from '../../hooks/useWorkspace';
 import { PANE_TYPES, paneLabel } from '../../lib/paneTypes';
 import EmptyWorkspace from './EmptyWorkspace';
@@ -19,12 +19,31 @@ export default function WorkspaceView({ workspace }) {
   // and "the workspace's current state."
   const state = { ...workspaceState, workspace };
 
+  // useWorkspace() returns a brand-new plain object every single time this
+  // component re-renders (it's just an object literal at the end of that
+  // hook, not something memoized) — so "workspaceState" itself is a
+  // different object on every render even when nothing meaningful in it
+  // actually changed. A ref lets the keydown handler below always read the
+  // LATEST workspaceState without needing to be recreated (and
+  // re-registered with the window) every time it changes identity — see
+  // the effect below for why that matters.
+  const workspaceStateRef = useRef(workspaceState);
+  workspaceStateRef.current = workspaceState;
+
   // Tab keyboard shortcuts, scoped to the focused pane:
   //   Ctrl+T new browser tab · Ctrl+W close active tab · Ctrl+(Shift+)Tab cycle
   //
   // In plain terms: this sets up a few familiar keyboard shortcuts, similar
   // to the ones in a web browser — Ctrl+T opens a new tab, Ctrl+W closes
   // the current one, and Ctrl+Tab / Ctrl+Shift+Tab jump between tabs.
+  //
+  // This effect depends only on "workspace" (not "workspaceState") so it
+  // attaches its window-wide keydown listener just ONCE per workspace,
+  // instead of tearing it down and re-adding it on every re-render — which
+  // is what would happen if it depended on workspaceState directly, since
+  // that object's identity changes constantly (see the ref above). The
+  // handler itself always reads workspaceStateRef.current, so it still acts
+  // on fully up-to-date data despite not being recreated every render.
   useEffect(() => {
     // If there's no workspace open, there's nothing to attach shortcuts to.
     if (!workspace) return undefined;
@@ -32,18 +51,19 @@ export default function WorkspaceView({ workspace }) {
       // Only react to Ctrl-held shortcuts, and ignore them if Alt is also
       // held (to avoid clashing with other OS-level shortcuts like Alt+Tab).
       if (!e.ctrlKey || e.altKey) return;
+      const current = workspaceStateRef.current;
       if (e.key === 'Tab') {
         e.preventDefault();
         // Ctrl+Shift+Tab cycles backward (-1), plain Ctrl+Tab cycles
         // forward (+1) through the open tabs.
-        workspaceState.cycleTab(e.shiftKey ? -1 : 1);
+        current.cycleTab(e.shiftKey ? -1 : 1);
       } else if (e.key.toLowerCase() === 'w' && !e.shiftKey) {
         e.preventDefault();
-        if (workspaceState.activeTabId) workspaceState.closeTab(workspaceState.activeTabId);
+        if (current.activeTabId) current.closeTab(current.activeTabId);
       } else if (e.key.toLowerCase() === 't' && !e.shiftKey) {
         e.preventDefault();
         const defaultType = PANE_TYPES[0].type;
-        workspaceState.createTab(defaultType, paneLabel(defaultType));
+        current.createTab(defaultType, paneLabel(defaultType));
       }
     };
     // Listen for key presses anywhere in the window (not just inside one
@@ -52,7 +72,7 @@ export default function WorkspaceView({ workspace }) {
     // end up with multiple overlapping shortcut handlers.
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [workspace, workspaceState]);
+  }, [workspace]);
 
   // No workspace selected at all — show the app's welcome/empty screen.
   if (!workspace) {

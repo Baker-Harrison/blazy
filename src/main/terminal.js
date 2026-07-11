@@ -137,18 +137,32 @@ function createTerminal(cwd) {
   // Avoid double-forcing Electron/Chromium color modes into the shell session.
   delete env.FORCE_COLOR;
 
-  const ptyProcess = pty.spawn(shell, [], {
-    name: 'xterm-256color',
-    cols: 80,
-    rows: 24,
-    cwd: cwd || os.homedir(),
-    env,
-    // ConPTY reflows the buffer on resize; winpty repaints it garbled.
-    // (ConPTY and winpty are two different ways Windows can emulate a
-    // proper terminal for a program like PowerShell; ConPTY is the newer,
-    // more correct one, so we always ask for it.)
-    useConpty: true,
-  });
+  // pty.spawn can throw SYNCHRONOUSLY — for example if the shell program
+  // named above (powershell.exe/zsh/bash) isn't actually installed, or the
+  // starting folder doesn't exist. Without this try/catch, that throw would
+  // escape all the way up through the 'terminal:create' handler below,
+  // which Electron turns into a rejected promise on the renderer side — but
+  // wrapping it here lets us turn it into a clear, specific error message
+  // (rather than whatever raw, technical message node-pty happens to
+  // throw), so the on-screen terminal pane can show something a user can
+  // actually understand instead of hanging forever with no explanation.
+  let ptyProcess;
+  try {
+    ptyProcess = pty.spawn(shell, [], {
+      name: 'xterm-256color',
+      cols: 80,
+      rows: 24,
+      cwd: cwd || os.homedir(),
+      env,
+      // ConPTY reflows the buffer on resize; winpty repaints it garbled.
+      // (ConPTY and winpty are two different ways Windows can emulate a
+      // proper terminal for a program like PowerShell; ConPTY is the newer,
+      // more correct one, so we always ask for it.)
+      useConpty: true,
+    });
+  } catch (err) {
+    throw new Error(`Couldn't start "${shell}": ${err.message}`);
+  }
 
   const entry = { pty: ptyProcess, buffer: '', unacked: 0, paused: false };
 
@@ -224,7 +238,18 @@ function resizeTerminal(id, cols, rows) {
 async function killTerminal(id) {
   const entry = terminals.get(id);
   if (entry) {
-    entry.pty.kill();
+    // The shell process could have already died on its own between the
+    // renderer deciding to close this tab and this handler actually
+    // running (e.g. the user typed "exit" right as they clicked "close
+    // tab"). Killing an already-dead process can throw — that's fine, it
+    // just means our job here is already done, so we swallow the error
+    // instead of letting it escape and abort the rest of this cleanup
+    // (deleting the tab's saved scrollback, below).
+    try {
+      entry.pty.kill();
+    } catch {
+      // Already exited — nothing left to kill.
+    }
     terminals.delete(id);
   }
   await db.deleteTerminalBuffer(id);

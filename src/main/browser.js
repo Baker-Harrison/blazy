@@ -92,6 +92,14 @@ function errorPage(url, description) {
 // share one favicon, so we don't re-fetch it for every tab.
 const faviconCache = new Map(); // faviconUrl -> data: URI (or null if it failed)
 const MAX_FAVICON_BYTES = 200_000; // Generous for an icon; guards against something misbehaving.
+// This cache has no natural size limit of its own — a long-running session
+// that visits many different websites would otherwise add one entry per
+// unique favicon URL FOREVER, for as long as the app stays open, slowly
+// growing memory usage with no ceiling. Capping it at a generous entry
+// count (each entry is small, so this is still cheap even at the cap) and
+// evicting the OLDEST entry once it's full keeps memory bounded while still
+// caching every favicon you're likely to see again soon.
+const MAX_FAVICON_CACHE_ENTRIES = 500;
 
 async function fetchFaviconDataUri(url) {
   if (faviconCache.has(url)) return faviconCache.get(url);
@@ -108,6 +116,12 @@ async function fetchFaviconDataUri(url) {
   } catch {
     // Network hiccup, blocked scheme, whatever — just show the fallback
     // globe icon instead of a broken image.
+  }
+  // A Map remembers insertion order, so its first key is always the
+  // oldest entry still in the cache — evict that one once we're full,
+  // right before adding the new one, so the cache never grows past the cap.
+  if (faviconCache.size >= MAX_FAVICON_CACHE_ENTRIES) {
+    faviconCache.delete(faviconCache.keys().next().value);
   }
   faviconCache.set(url, result);
   return result;

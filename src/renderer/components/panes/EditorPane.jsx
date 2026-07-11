@@ -21,6 +21,19 @@ import { markdownLinkForDrop } from '../../lib/dragPaste';
 // permanently shrinking everything to fit.
 const NARROW_BREAKPOINT = 560;
 
+// Folder names to never automatically dig into when pre-loading the
+// Explorer tree (see loadDir below) — these commonly hold tens of
+// thousands of files (installed packages, build output, version-control
+// internals) that nobody opens the Explorer wanting to browse, and eagerly
+// reading them can make opening a workspace feel like it's hung. You can
+// still open one of these folders by hand — clicking to expand it always
+// reads its contents on demand (see toggleFolder below) — this only skips
+// reading it automatically, up front, for free.
+const HEAVY_DIRS = new Set([
+  'node_modules', '.git', 'dist', 'build', '.next', '.cache',
+  '__pycache__', '.venv', 'venv', 'target',
+]);
+
 export default function EditorPane({ tab, workspace }) {
   const rootPath = workspace.workspace?.path;
   // The folder tree data (files and subfolders) to show in the Explorer.
@@ -111,15 +124,31 @@ export default function EditorPane({ tab, workspace }) {
   // Explorer usually feels instant instead of needing to fetch again. Any
   // folder we can't read (e.g. permission denied) is silently treated as
   // empty rather than crashing the whole tree.
+  //
+  // Two things keep this fast even on a big project folder:
+  //  1. We SKIP eagerly preloading known "heavy" folders (node_modules,
+  //     .git, build output, etc. — see HEAVY_DIRS below). These can contain
+  //     tens of thousands of files, and nobody opens the Explorer wanting
+  //     to stare at node_modules anyway. Skipping the preload doesn't stop
+  //     you from ever seeing inside one — toggleFolder() below still loads
+  //     a folder's contents the moment you actually click to expand it;
+  //     this just avoids reading it automatically, up front, for free.
+  //  2. Sibling folders at the same depth are all read in PARALLEL
+  //     (Promise.all) instead of one at a time. Reading them one-by-one
+  //     means each folder has to wait for the previous one's disk read to
+  //     fully finish before even starting its own — for a folder with many
+  //     subfolders, that adds up to a very slow, needlessly serial chain.
   const loadDir = useCallback(async (dirPath, depth = 0) => {
     try {
       const entries = await window.fs.readDir(dirPath);
       if (depth < 2) {
-        for (const entry of entries) {
-          if (entry.isDirectory) {
-            entry.children = await loadDir(entry.path, depth + 1);
-          }
-        }
+        await Promise.all(
+          entries.map(async (entry) => {
+            if (entry.isDirectory && !HEAVY_DIRS.has(entry.name)) {
+              entry.children = await loadDir(entry.path, depth + 1);
+            }
+          })
+        );
       }
       return entries;
     } catch {

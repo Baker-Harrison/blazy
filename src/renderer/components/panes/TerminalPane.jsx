@@ -413,6 +413,30 @@ export default function TerminalPane({ tab, workspace }) {
           session.mounted = false;
           if (host.parentNode) host.parentNode.removeChild(host);
         }
+      }).catch((err) => {
+        // Setup can fail outright — most commonly, the background process
+        // couldn't start the shell program at all (see terminal.js's
+        // createTerminal, which now throws a clear error for that case
+        // instead of leaving this hanging forever). Without this catch,
+        // that failure would be a silent, unhandled promise rejection and
+        // this pane would just sit there blank/spinning with no
+        // explanation and no way to recover.
+        //
+        // Depending on exactly when the failure happened, the terminal
+        // widget itself might already exist (registered in the module-wide
+        // `sessions` map) or might not have gotten that far yet — grab
+        // whichever is true so the SAME cleanup path below (which already
+        // knows how to dispose of a "dead" session) handles this one too,
+        // instead of needing special-case teardown logic.
+        session = sessions.get(tab.id) || null;
+        if (session) {
+          session.dead = true;
+          session.term.write(`\r\n\x1b[31mCouldn't start this terminal: ${err.message}\x1b[0m\r\n`);
+        } else {
+          host.textContent = `Couldn't start this terminal: ${err.message}`;
+          host.style.cssText +=
+            'display:flex;align-items:center;justify-content:center;color:#9aa1ad;font-size:13px;padding:16px;text-align:center;';
+        }
       });
     }
 

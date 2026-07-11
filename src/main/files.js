@@ -11,11 +11,22 @@ const path = require('path'); // Helpers for building/joining file paths correct
 
 // Lists everything inside a folder (files and subfolders), similar to what
 // you'd see opening that folder in File Explorer/Finder.
+//
+// This uses the non-blocking ("asynchronous") version of the file-reading
+// function — fs.promises.readdir — instead of the plain fs.readdirSync one.
+// The "Sync" version freezes this WHOLE background process (which also
+// handles every open terminal's output and every browser tab's on-screen
+// position) until the folder listing finishes reading from disk. That's
+// invisible for a small folder, but for a big one (or a slow network
+// drive) it can freeze terminals and browser tabs mid-scroll for as long
+// as the listing takes. The "await fs.promises.readdir(...)" version below
+// instead hands the actual disk work off to Node's own background thread
+// pool and lets everything else in the app keep running while it waits.
 async function readDir(dirPath) {
   // Ask the operating system for every item directly inside this folder.
   // "withFileTypes: true" means each item also tells us whether it's a
   // file or a folder, so we don't have to ask separately.
-  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
   return entries
     .map((entry) => ({
       name: entry.name,
@@ -32,16 +43,30 @@ async function readDir(dirPath) {
 }
 
 // Reads the full text contents of a single file (used, for example, when
-// opening a file in the code editor pane).
+// opening a file in the code editor pane). Uses the non-blocking
+// fs.promises.readFile — see readDir's comment above for why the plain,
+// blocking "Sync" versions are avoided everywhere in this file.
 async function readFile(filePath) {
-  return fs.readFileSync(filePath, 'utf-8');
+  return fs.promises.readFile(filePath, 'utf-8');
 }
 
 // Saves text content to a file, overwriting whatever was there before (used
-// when you hit "save" in the code editor).
+// when you hit "save" in the code editor). Uses the non-blocking
+// fs.promises.writeFile.
 async function writeFile(filePath, content) {
-  fs.writeFileSync(filePath, content, 'utf-8');
+  await fs.promises.writeFile(filePath, content, 'utf-8');
 }
+
+// The biggest binary file we'll read and hand over to the on-screen UI, in
+// bytes (100 MB). Binary files travel to the renderer as one giant base64
+// text string (see below) — base64 makes the data about a third BIGGER
+// than the original file, and that whole string has to be built in memory
+// and copied across the IPC bridge in one piece. Without a limit, opening
+// an accidentally-huge PDF or spreadsheet could balloon memory usage by
+// hundreds of megabytes and freeze/crash the on-screen window. Viewing a
+// file bigger than this cleanly fails instead (see the viewer components'
+// "Couldn't load this file" messages), rather than the app choking on it.
+const MAX_BINARY_FILE_BYTES = 100 * 1024 * 1024;
 
 // Reads a file as raw bytes and hands it back as "base64" — a way of
 // encoding arbitrary binary data (like an image or a spreadsheet file) as
@@ -49,9 +74,16 @@ async function writeFile(filePath, content) {
 // over the messaging bridge between the background process and the
 // on-screen UI. This is used for file types where reading as plain text
 // (like readFile above does) would corrupt the data — images, .xlsx
-// spreadsheets, PDFs, etc.
+// spreadsheets, PDFs, etc. Uses the non-blocking fs.promises.readFile.
 async function readFileBinary(filePath) {
-  const buffer = fs.readFileSync(filePath);
+  // Check the file's size BEFORE reading it, so an oversized file fails
+  // fast with a clear error instead of us reading the whole thing into
+  // memory first and only then deciding it was too big.
+  const stats = await fs.promises.stat(filePath);
+  if (stats.size > MAX_BINARY_FILE_BYTES) {
+    throw new Error(`File is too large to open (${Math.round(stats.size / (1024 * 1024))} MB)`);
+  }
+  const buffer = await fs.promises.readFile(filePath);
   return buffer.toString('base64');
 }
 
