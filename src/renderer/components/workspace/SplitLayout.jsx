@@ -1,4 +1,4 @@
-import { Fragment } from 'react';
+import { Fragment, memo } from 'react';
 import { Panel, Group, Separator } from 'react-resizable-panels';
 import PaneContainer from './PaneContainer';
 
@@ -10,11 +10,10 @@ import PaneContainer from './PaneContainer';
 // arbitrarily complex grid-like layouts (e.g. one editor on the left, and a
 // terminal stacked above a browser on the right).
 //
-// "node" describes the layout using a tree structure:
-// - a "pane" node is a single, non-split content area (like one tab).
-// - anything else is a "split" node with a direction (horizontal/vertical),
-//   a list of child nodes, and how much space each child should take up.
-export default function SplitLayout({ node, workspace }) {
+// We wrap this component in `memo` so React only re-evaluates a split branch
+// when its specific layout node or workspace props actually change, avoiding
+// wasteful redraws across unrelated parts of the split tree.
+const SplitLayout = memo(function SplitLayout({ node, workspace }) {
   // Nothing to draw if there's no layout defined yet.
   if (!node) return null;
 
@@ -84,4 +83,6 @@ export default function SplitLayout({ node, workspace }) {
       ))}
     </Group>
   );
-}
+});
+
+export default SplitLayout;

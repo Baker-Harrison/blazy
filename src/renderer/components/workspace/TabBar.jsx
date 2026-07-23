@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useRef, useState } from 'react';
 import { CloseIcon, PlusIcon } from '../icons';
 import { PANE_TYPES, paneIcon, paneLabel } from '../../lib/paneTypes';
 
@@ -7,27 +7,12 @@ import { PANE_TYPES, paneIcon, paneLabel } from '../../lib/paneTypes';
 // This file draws that strip, handles dragging tabs to reorder/move them,
 // double-click-to-rename, right-click context menus, and the "+" button
 // for adding a new tab.
-
-// Whenever a floating menu (the tab context menu, or the "add tab"
-// dropdown) is open, embedded browser panes need to be told to temporarily
-// hide themselves — native browser views always render on TOP of regular
-// web content, so without this, an open menu could get visually covered by
-// a browser tab's page. This tiny reference counter tracks how many menus
-// are currently open across the whole app, so overlays only get "turned
-// off" once every menu that requested it has actually closed.
-let overlayRefCount = 0;
-function setBrowserOverlay(open) {
-  overlayRefCount += open ? 1 : -1;
-  if (overlayRefCount < 0) overlayRefCount = 0;
-  window.browser?.setOverlayOpen(overlayRefCount > 0);
-}
-
-export default function TabBar({ pane, tabs, workspace }) {
+//
+// We wrap `TabBar` in `memo` so that tab bars in other panes don't re-render
+// when a tab in a different pane is clicked or created.
+const TabBar = memo(function TabBar({ pane, tabs, workspace }) {
   const { activateTab, closeTab, createTab, reorderTabInPane, moveTabToPane } = workspace;
   const paneId = pane.id;
-  // The currently open right-click context menu, if any: which tab it's
-  // for and where on screen to draw it.
-  const [menu, setMenu] = useState(null); // { tabId, x, y }
 
   // Handles dropping a tab (dragged from ANOTHER pane) onto empty space in
   // this tab bar — moves it into this pane, appended at the end.
@@ -37,6 +22,44 @@ export default function TabBar({ pane, tabs, workspace }) {
     const sourcePaneId = e.dataTransfer.getData('application/blazy-source-pane');
     if (!tabId || sourcePaneId === paneId) return;
     moveTabToPane(tabId, paneId);
+  };
+
+  // Opens the right-click menu for a tab as a real OS menu, then runs the
+  // matching workspace action for whatever item the user picked. Using a
+  // native menu means we never have to hide open browser pages just so the
+  // menu stays readable (see the file-level comment above).
+  const openTabContextMenu = async (e, tabId) => {
+    e.preventDefault();
+    // If the appMenu bridge isn't available for some reason, do nothing
+    // rather than crash — the rest of the tab strip still works.
+    if (!window.appMenu?.popup) return;
+
+    const tabCount = tabs.length;
+    // Build the list of choices. "id" is what comes back when the user
+    // clicks; "disabled" greys out options that don't make sense right now
+    // (e.g. "Split right" when this pane only has one tab — splitting would
+    // leave nothing behind in the original half).
+    const items = [
+      { id: 'duplicate', label: 'Duplicate' },
+      { id: 'split-right', label: 'Split right', disabled: tabCount < 2 },
+      { id: 'split-down', label: 'Split down', disabled: tabCount < 2 },
+      { divider: true },
+      { id: 'close', label: 'Close' },
+      { id: 'close-others', label: 'Close others', disabled: tabCount < 2 },
+      { id: 'close-pane', label: 'Close pane' },
+    ];
+
+    // Open the menu at the mouse cursor. Resolves with the chosen item's
+    // id, or null if the user dismissed the menu without picking anything.
+    const choice = await window.appMenu.popup(items, e.clientX, e.clientY);
+    if (!choice) return;
+
+    if (choice === 'duplicate') workspace.duplicateTab(tabId);
+    else if (choice === 'split-right') workspace.splitPane(paneId, 'horizontal', tabId);
+    else if (choice === 'split-down') workspace.splitPane(paneId, 'vertical', tabId);
+    else if (choice === 'close') workspace.closeTab(tabId);
+    else if (choice === 'close-others') workspace.closeOtherTabs(paneId, tabId);
+    else if (choice === 'close-pane') workspace.closePane(paneId);
   };
 
   return (
@@ -65,10 +88,7 @@ export default function TabBar({ pane, tabs, workspace }) {
             onActivate={() => activateTab(tab.id, paneId)}
             onClose={() => closeTab(tab.id)}
             onRename={(title) => workspace.renameTab(tab.id, title)}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              setMenu({ tabId: String(tab.id), x: e.clientX, y: e.clientY });
-            }}
+            onContextMenu={(e) => openTabContextMenu(e, String(tab.id))}
             onReorder={(tabId, newIndex) => reorderTabInPane(paneId, tabId, newIndex)}
             onMoveFromOtherPane={(tabId, insertIndex) =>
               moveTabToPane(tabId, paneId, insertIndex)
@@ -77,24 +97,19 @@ export default function TabBar({ pane, tabs, workspace }) {
         ))}
       </div>
       <TabAddButton onSelect={(type) => createTab(type, paneLabel(type), {}, { paneId })} />
-      {menu && (
-        <TabContextMenu
-          menu={menu}
-          paneId={paneId}
-          tabCount={tabs.length}
-          workspace={workspace}
-          onClose={() => setMenu(null)}
-        />
-      )}
     </div>
   );
-}
+});
+
+export default TabBar;
 
 // One draggable tab "chip" in the tab strip: shows an icon (or the site's
 // favicon for browser tabs), the tab's title (double-click to rename it),
 // and a small close button. Supports being dragged to reorder within the
 // same pane, or dragged into a different pane entirely.
-function DraggableTab({
+// Wrapped in `memo` so that switching between two tabs doesn't re-render
+// every other un-involved tab in the strip.
+const DraggableTab = memo(function DraggableTab({
   tab,
   index,
   paneId,
@@ -228,7 +243,7 @@ function DraggableTab({
       </button>
     </div>
   );
-}
+});
 
 // The small inline text box shown while renaming a tab, following the same
 // commit-on-Enter/blur, cancel-on-Escape pattern used elsewhere in the app
@@ -263,151 +278,39 @@ function TabRenameInput({ value, onCommit, onCancel }) {
   );
 }
 
-// The right-click menu for a tab, offering Duplicate, Split right/down
-// (create a new split section with a copy or move of this tab), and
-// various close actions.
-function TabContextMenu({ menu, paneId, tabCount, workspace, onClose }) {
-  const ref = useRef(null);
-  const [pos, setPos] = useState({ x: menu.x, y: menu.y });
-
-  // While this menu is open, tell any browser panes to hide themselves so
-  // the menu isn't visually covered (see setBrowserOverlay above).
-  useEffect(() => {
-    setBrowserOverlay(true);
-    return () => setBrowserOverlay(false);
-  }, []);
-
-  // Keep the menu on-screen.
-  // In plain terms: if the menu was about to open partly off the edge of
-  // the window (e.g. you right-clicked a tab near the right edge), nudge
-  // its position back so the whole menu stays visible instead of getting
-  // cut off.
-  useEffect(() => {
-    if (!ref.current) return;
-    const rect = ref.current.getBoundingClientRect();
-    setPos({
-      x: Math.min(menu.x, window.innerWidth - rect.width - 4),
-      y: Math.min(menu.y, window.innerHeight - rect.height - 4),
-    });
-  }, [menu]);
-
-  // Pressing Escape closes the menu, matching standard menu behavior.
-  useEffect(() => {
-    const onKey = (e) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
-  // Wraps a menu action so that clicking any item both closes the menu AND
-  // runs the action, instead of having to remember to do both every time.
-  const run = (fn) => () => {
-    onClose();
-    fn();
-  };
-
-  const items = [
-    { label: 'Duplicate', action: run(() => workspace.duplicateTab(menu.tabId)) },
-    {
-      label: 'Split right',
-      action: run(() => workspace.splitPane(paneId, 'horizontal', menu.tabId)),
-      // "Split" only makes sense if there's more than one tab in the pane
-      // — splitting a pane that only has one tab wouldn't leave anything
-      // behind in the original half.
-      disabled: tabCount < 2,
-    },
-    {
-      label: 'Split down',
-      action: run(() => workspace.splitPane(paneId, 'vertical', menu.tabId)),
-      disabled: tabCount < 2,
-    },
-    { divider: true },
-    { label: 'Close', action: run(() => workspace.closeTab(menu.tabId)) },
-    {
-      label: 'Close others',
-      action: run(() => workspace.closeOtherTabs(paneId, menu.tabId)),
-      disabled: tabCount < 2,
-    },
-    { label: 'Close pane', action: run(() => workspace.closePane(paneId)) },
-  ];
-
-  return (
-    <>
-      {/* An invisible full-screen overlay that closes the menu when you
-          click (or right-click) anywhere outside of it — the standard way
-          context menus dismiss themselves. */}
-      <div className="fixed inset-0 z-30" onClick={onClose} onContextMenu={(e) => { e.preventDefault(); onClose(); }} />
-      <div
-        ref={ref}
-        style={{ left: pos.x, top: pos.y }}
-        className="fixed z-40 min-w-[150px] rounded-md border border-edge bg-surface py-1 shadow-lg"
-      >
-        {items.map((item, i) =>
-          item.divider ? (
-            <div key={i} className="my-1 border-t border-edge" />
-          ) : (
-            <button
-              key={item.label}
-              type="button"
-              disabled={item.disabled}
-              onClick={item.action}
-              className="flex w-full items-center px-3 py-1.5 text-left text-[12px] text-ink hover:bg-hover disabled:cursor-default disabled:text-ink-dim/50 disabled:hover:bg-transparent"
-            >
-              {item.label}
-            </button>
-          )
-        )}
-      </div>
-    </>
-  );
-}
-
-// The "+" button on the tab strip, which opens a small dropdown letting you
-// pick which type of tab (Browser/Terminal/Editor) to add.
+// The "+" button on the tab strip, which opens a small menu letting you
+// pick which type of tab (Browser / Terminal / Editor) to add.
+//
+// This deliberately uses a native OS menu (window.appMenu.popup) instead of
+// an HTML dropdown. An older version drew an HTML menu and had to hide
+// every open browser page while it was up — otherwise the native browser
+// view would paint over the menu. Hiding the page made the browser look
+// blank. A native menu floats above the page, so the browser content stays
+// visible the whole time you are choosing a panel type.
 function TabAddButton({ onSelect }) {
-  const [open, setOpen] = useState(false);
+  const handleClick = async (e) => {
+    if (!window.appMenu?.popup) return;
 
-  // While the dropdown is open, hide browser panes so they don't render
-  // over it (same overlay mechanism used by the context menu above).
-  useEffect(() => {
-    if (open) setBrowserOverlay(true);
-    return () => {
-      if (open) setBrowserOverlay(false);
-    };
-  }, [open]);
+    // Open the menu just under the "+" button (using the button's on-screen
+    // rectangle), so it feels attached to the control the user clicked.
+    const rect = e.currentTarget.getBoundingClientRect();
+    const items = PANE_TYPES.map(({ type, label }) => ({ id: type, label }));
+    const choice = await window.appMenu.popup(items, rect.left, rect.bottom);
+    // choice is the pane type string ('browser' / 'terminal' / 'editor'),
+    // or null if the user closed the menu without picking anything.
+    if (choice) onSelect(choice);
+  };
 
   return (
     <div className="relative shrink-0">
       <button
         type="button"
         title="New tab"
-        onClick={() => setOpen((v) => !v)}
+        onClick={handleClick}
         className="flex h-7 w-7 items-center justify-center rounded text-ink-dim hover:bg-hover hover:text-ink"
       >
         <PlusIcon />
       </button>
-      {open && (
-        <>
-          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 top-8 z-40 min-w-[140px] rounded-md border border-edge bg-surface py-1 shadow-lg">
-            {PANE_TYPES.map(({ type, label, icon: Icon }) => (
-              <button
-                key={type}
-                type="button"
-                onClick={() => {
-                  onSelect(type);
-                  setOpen(false);
-                }}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-ink hover:bg-hover"
-              >
-                <Icon />
-                {label}
-              </button>
-            ))}
-          </div>
-        </>
-      )}
     </div>
   );
 }

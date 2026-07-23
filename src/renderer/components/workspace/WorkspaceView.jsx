@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { useWorkspace } from '../../hooks/useWorkspace';
 import { PANE_TYPES, paneLabel } from '../../lib/paneTypes';
 import EmptyWorkspace from './EmptyWorkspace';
@@ -15,9 +15,13 @@ export default function WorkspaceView({ workspace }) {
   const { ready, layout } = workspaceState;
   // Combine the workspace's basic info (name, id, etc.) with all its live
   // state/actions into one object that gets passed down to child
-  // components, so they don't need two separate props for "the workspace"
-  // and "the workspace's current state."
-  const state = { ...workspaceState, workspace };
+  // components. We wrap this in `useMemo` so that child components receiving
+  // `state` as a prop won't re-render on every frame unless `workspaceState`
+  // or `workspace` has genuinely changed.
+  const state = useMemo(
+    () => ({ ...workspaceState, workspace }),
+    [workspaceState, workspace]
+  );
 
   // useWorkspace() returns a brand-new plain object every single time this
   // component re-renders (it's just an object literal at the end of that

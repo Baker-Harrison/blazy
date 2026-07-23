@@ -653,7 +653,14 @@ export default function EditorPane({ tab, workspace }) {
                   }}
                   options={{
                     minimap: { enabled: false }, // Disables the small zoomed-out code preview on the right edge.
-                    fontSize: 13,
+                    fontSize: narrow ? 12 : 13,
+                    // In narrow split panes (< 560px), hide line numbers and margins
+                    // so code text gets maximum horizontal room without being squished.
+                    lineNumbers: narrow ? 'off' : 'on',
+                    glyphMargin: !narrow,
+                    folding: !narrow,
+                    lineDecorationsWidth: narrow ? 4 : 10,
+                    lineNumbersMinChars: narrow ? 0 : 3,
                     automaticLayout: true, // Keeps the editor correctly sized as its container resizes.
                     scrollBeyondLastLine: false,
                     // Wraps long lines to fit the visible width instead of

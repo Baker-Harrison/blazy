@@ -100,6 +100,18 @@ contextBridge.exposeInMainWorld('terminals', {
   },
 });
 
+// Opens a real operating-system popup menu (not a fake HTML one) and
+// returns the id of the item the user picked, or null if they dismissed
+// the menu. Used by the tab strip's "+" button and right-click menu so
+// the embedded browser page does not have to be hidden while the menu is
+// open — native menus always float above native browser views. See
+// registerMenuHandlers in main.js for the background side.
+contextBridge.exposeInMainWorld('appMenu', {
+  // items: array of { id, label, disabled? } or { divider: true }
+  // x, y: optional pixel position (relative to the window) to open at
+  popup: (items, x, y) => ipcRenderer.invoke('menu:popup', items, x, y),
+});
+
 // Controls for the embedded Browser pane (a mini web browser inside the
 // app). See browser.js for how the background process actually manages the
 // real browser view underneath.

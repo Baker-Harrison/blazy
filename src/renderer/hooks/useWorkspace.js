@@ -519,31 +519,65 @@ export function useWorkspace(workspaceId) {
   }, [layout, focusedPaneId]);
 
   // Hand back everything a component needs to display and control this
-  // workspace's tabs and layout.
-  return {
-    workspaceId,
-    tabs,
-    tabsById,
-    layout,
-    ready,
-    focusedPaneId,
-    activeTabId,
-    refreshTabs,
-    createTab,
-    updateTab,
-    renameTab,
-    duplicateTab,
-    closeTab,
-    closeOtherTabs,
-    closePane,
-    activateTab,
-    reorderTabInPane,
-    moveTabToPane,
-    splitPane,
-    focusPane,
-    cycleTab,
-    resizeSplit,
-    openFileInPane,
-    openUrlInPane,
-  };
+  // workspace's tabs and layout. We wrap this returned object in `useMemo`
+  // so that its identity stays stable between re-renders as long as none of
+  // the live data (tabs, layout, focus) actually changed. Without `useMemo`,
+  // JavaScript would create a brand-new object literal on every single render,
+  // which would trick child components into thinking all workspace data had
+  // changed and cause the entire screen (all split panes and tabs) to redraw
+  // unnecessarily.
+  return useMemo(
+    () => ({
+      workspaceId,
+      tabs,
+      tabsById,
+      layout,
+      ready,
+      focusedPaneId,
+      activeTabId,
+      refreshTabs,
+      createTab,
+      updateTab,
+      renameTab,
+      duplicateTab,
+      closeTab,
+      closeOtherTabs,
+      closePane,
+      activateTab,
+      reorderTabInPane,
+      moveTabToPane,
+      splitPane,
+      focusPane,
+      cycleTab,
+      resizeSplit,
+      openFileInPane,
+      openUrlInPane,
+    }),
+    [
+      workspaceId,
+      tabs,
+      tabsById,
+      layout,
+      ready,
+      focusedPaneId,
+      activeTabId,
+      refreshTabs,
+      createTab,
+      updateTab,
+      renameTab,
+      duplicateTab,
+      closeTab,
+      closeOtherTabs,
+      closePane,
+      activateTab,
+      reorderTabInPane,
+      moveTabToPane,
+      splitPane,
+      focusPane,
+      cycleTab,
+      resizeSplit,
+      openFileInPane,
+      openUrlInPane,
+    ]
+  );
 }

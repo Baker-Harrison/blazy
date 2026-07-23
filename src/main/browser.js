@@ -11,6 +11,10 @@ const BG = '#16171b';
 let win = null;
 let nextTabId = 1;
 let overlayOpen = false;
+// Ensures we only wire up the shared browser session (user-agent, headers,
+// permissions) once, the first time any browser pane is created — not on
+// every tab open.
+let browserSessionConfigured = false;
 
 // paneId -> { tabs: Map<tabId, TabEntry>, order: [tabId], activeTabId,
 //             bounds, visible }
@@ -20,6 +24,126 @@ const panes = new Map();
 
 function browserSession() {
   return session.fromPartition(PARTITION);
+}
+
+// Builds a "looks like regular Google Chrome" user-agent string, using the
+// real Chromium version that this copy of Electron ships with.
+//
+// Why this matters (plain language):
+// Every browser identifies itself to websites with a short text string
+// called the "user agent." Electron's default string includes words like
+// "Electron" and the app name. Lots of major sites (YouTube, Google,
+// banking sites, etc.) notice that and serve a stripped-down, broken, or
+// differently styled page — missing icons, half-working buttons, weird
+// layouts. By presenting as plain Chrome with the same engine version we
+// actually have, those sites treat us like a normal desktop browser and
+// their full UI works correctly.
+function chromeUserAgent() {
+  // process.versions.chrome is e.g. "126.0.6478.234" — the Chromium build
+  // baked into this Electron release. Keep it exact so version checks and
+  // feature detection on sites match what we can actually do.
+  const chrome = process.versions.chrome || '126.0.0.0';
+  // Windows desktop Chrome shape. (This app is Windows-first; if we ever
+  // ship macOS/Linux builds, this should pick the platform string to match.)
+  return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chrome} Safari/537.36`;
+}
+
+// Major Chrome version number only (e.g. "126"), used in Client Hints
+// headers that modern sites also check — not just the classic User-Agent.
+function chromeMajorVersion() {
+  const chrome = process.versions.chrome || '126.0.0.0';
+  return chrome.split('.')[0] || '126';
+}
+
+// One-time setup for the shared "persist:blazy-browser" session: make every
+// tab in every browser pane look and behave like Chrome to the outside
+// world. Called from registerBrowserHandlers before any page loads.
+function configureBrowserSession() {
+  if (browserSessionConfigured) return;
+  browserSessionConfigured = true;
+
+  const ses = browserSession();
+  const ua = chromeUserAgent();
+  const major = chromeMajorVersion();
+
+  // Session-level UA covers navigations and most subresource requests for
+  // every tab that uses this partition.
+  ses.setUserAgent(ua, 'en-US,en');
+
+  // Modern Chromium also sends "Client Hints" headers (Sec-CH-UA, etc.).
+  // Even after you fix the classic User-Agent string, those headers can
+  // still say "Electron" — and sites that trust Client Hints more than
+  // User-Agent will still treat you as a weird embed. Rewrite them to
+  // match a normal Chrome desktop browser on every outgoing request.
+  const secChUa = `"Google Chrome";v="${major}", "Chromium";v="${major}", "Not-A.Brand";v="99"`;
+  const secChUaFull = `"Google Chrome";v="${process.versions.chrome || major}", "Chromium";v="${process.versions.chrome || major}", "Not-A.Brand";v="10.0.1.4"`;
+
+  // The exact set of Client Hint header names real Chrome sends, all
+  // lowercase — HTTP/2 requires lowercase header names on the wire, and
+  // Chromium's own network stack always emits them that way. Setting both
+  // "Sec-CH-UA" and "sec-ch-ua" as separate JavaScript object keys (as an
+  // earlier version of this code did) makes two different-cased headers
+  // go out on the same request. Sites like YouTube treat that mismatch as
+  // a sign of a tampered/non-standard client and quietly serve back a
+  // reduced UI — missing icons, blank buttons — instead of erroring, which
+  // is what made this bug so easy to miss.
+  const CH_HEADERS = {
+    'sec-ch-ua': secChUa,
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-ch-ua-full-version-list': secChUaFull,
+  };
+
+  ses.webRequest.onBeforeSendHeaders((details, callback) => {
+    const headers = { ...details.requestHeaders };
+    // Remove whatever casing Electron/Chromium originally used for these
+    // headers, then re-add them under the single canonical lowercase name
+    // — guarantees exactly one copy of each goes out, never a duplicate.
+    for (const key of Object.keys(headers)) {
+      if (/^sec-ch-ua/i.test(key) || key.toLowerCase() === 'user-agent') delete headers[key];
+    }
+    headers['User-Agent'] = ua;
+    // Only add Client Hints when the request was already going to carry
+    // them (a request with none of these keys is one where the site
+    // never asks for Client Hints at all, so don't invent them).
+    const hadClientHints = Object.keys(details.requestHeaders).some((k) => /^sec-ch-ua/i.test(k));
+    if (hadClientHints) Object.assign(headers, CH_HEADERS);
+    callback({ requestHeaders: headers });
+  });
+
+  // Permissions sites commonly ask for. We allow the ones a normal
+  // browser would grant without a scary prompt for everyday browsing
+  // (clipboard, fullscreen, media playback). Camera/mic still need a
+  // real prompt UI later — for now allow media so video/audio sites
+  // (YouTube, etc.) can play and use WebAudio without silently failing.
+  ses.setPermissionRequestHandler((_wc, permission, callback) => {
+    const allowed = new Set([
+      'clipboard-sanitized-write',
+      'clipboard-read',
+      'fullscreen',
+      'pointerLock',
+      'media',
+      'mediaKeySystem',
+      'notifications',
+    ]);
+    callback(allowed.has(permission));
+  });
+
+  // Some sites check permissions synchronously (without a prompt flow).
+  // Mirror the same allow-list so those checks don't report "denied"
+  // and disable features before the page even tries.
+  ses.setPermissionCheckHandler((_wc, permission) => {
+    const allowed = new Set([
+      'clipboard-sanitized-write',
+      'clipboard-read',
+      'fullscreen',
+      'pointerLock',
+      'media',
+      'mediaKeySystem',
+      'notifications',
+    ]);
+    return allowed.has(permission);
+  });
 }
 
 function send(channel, ...args) {
@@ -268,15 +392,32 @@ function attachViewEvents(paneId, tab) {
 
 function materialize(paneId, tab) {
   if (tab.view) return;
+  // Make sure the shared browser session has the Chrome-like identity and
+  // permissions applied before this tab's first network request.
+  configureBrowserSession();
   tab.view = new WebContentsView({
     webPreferences: {
       partition: PARTITION,
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      // Let pages use modern web features (WebGL, WebAudio, etc.) the same
+      // way Chrome would — some sites (maps, video editors, games) break
+      // or look empty without these.
+      webgl: true,
+      plugins: true,
+      // Spell-check is a small quality-of-life match with real browsers.
+      spellcheck: true,
     },
   });
   tab.view.setBackgroundColor(BG);
+  // Belt-and-suspenders: also set the UA on this specific page, in case a
+  // future Electron change stops inheriting session UA for new views.
+  try {
+    tab.view.webContents.setUserAgent(chromeUserAgent());
+  } catch {
+    // Older edge cases — session-level UA still applies.
+  }
   attachViewEvents(paneId, tab);
   tab.view.webContents.loadURL(tab.url).catch(() => {});
 }
@@ -445,11 +586,9 @@ function activeWebContents(paneId) {
 }
 
 function registerBrowserHandlers(getWindow) {
-  browserSession().setPermissionRequestHandler((_wc, permission, callback) => {
-    // Quiet defaults for a daily driver; extend with a prompt UI later.
-    const allowed = ['clipboard-sanitized-write', 'fullscreen', 'pointerLock'];
-    callback(allowed.includes(permission));
-  });
+  // Apply Chrome-compatible identity + permissions once at startup so the
+  // first page a user opens already looks correct (not "broken Electron UI").
+  configureBrowserSession();
 
   ipcMain.handle('browser:ensurePane', (_e, paneId, saved) => {
     win = getWindow();

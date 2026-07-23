@@ -39,14 +39,14 @@ describe('handleTerminalKeyEvent', () => {
     expect(result).toBe(true);
   });
 
-  it('pastes clipboard text into the shell and blocks the keystroke on Ctrl+V', async () => {
+  it('blocks the keystroke on Ctrl+V so the native browser paste event can handle it without double pasting', () => {
     const deps = makeDeps({ readClipboardText: vi.fn().mockResolvedValue('pasted text') });
     const result = handleTerminalKeyEvent(
       { type: 'keydown', ctrlKey: true, key: 'v' },
       deps
     );
     expect(result).toBe(false);
-    await vi.waitFor(() => expect(deps.pasteText).toHaveBeenCalledWith('pasted text'));
+    expect(deps.pasteText).not.toHaveBeenCalled();
   });
 
   it('ignores plain letter keys typed without Ctrl (e.g. typing "cat" in the shell)', () => {

@@ -14,6 +14,38 @@ const { registerFileHandlers } = require('./files');
 const { registerBrowserHandlers } = require('./browser');
 const { registerUpdaterHandlers } = require('./updater');
 
+// Make sure only ONE copy of Blazy is ever running at a time.
+//
+// Why this matters (plain language): every copy of the app shares the
+// same on-disk folder for its browser cache and cookies (Windows:
+// %APPDATA%\blazy). If a second copy somehow starts up — a leftover
+// window from an earlier dev-server run that never fully closed, a
+// double-click while one was already open, etc. — both copies try to
+// read and write that same cache folder at once. Windows won't let two
+// programs rename/replace the same cache files at the same moment, so
+// this shows up as "Unable to move the cache: Access is denied" errors,
+// and any web page resource that depends on that broken cache (this is
+// how we tracked down YouTube's missing search/notification icons — a
+// font file was failing to load with a cache error) can silently fail to
+// load. Grabbing this lock guarantees there's only ever one copy running:
+// if a second launch is attempted, Electron hands it right back to us
+// (see the 'second-instance' handler below) instead of letting it start.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  // Another copy is already running — let IT be the one that keeps going,
+  // and quit this brand-new, redundant copy immediately.
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    // Someone tried to open Blazy again while it was already running:
+    // bring the existing window to the front instead of opening a new one.
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
 // While developing (not yet packaged into a finished .exe/installer),
 // automatically reload the app whenever this background code changes, so
 // you don't have to manually restart it after every edit. If this fails
@@ -99,6 +131,68 @@ function registerClipboardHandlers() {
   ipcMain.handle('clipboard:writeText', (_e, text) => clipboard.writeText(text));
 }
 
+// Registers a helper that lets the on-screen UI open a REAL operating-system
+// menu (the same kind of popup menu you get when you right-click in most
+// desktop apps). Why bother instead of drawing a fake HTML menu?
+//
+// The embedded Browser pane paints its pages as a native "WebContentsView"
+// that always sits ON TOP of regular HTML. An HTML dropdown drawn under a
+// browser tab would get covered by the page — so the old code hid every
+// open browser whenever a menu opened, which made the page go blank. A
+// native OS menu floats above everything (including those browser views),
+// so the page can stay visible while you pick an option.
+//
+// The UI sends a list of items like [{ id: 'browser', label: 'Browser' }].
+// When the user clicks one, we resolve with that item's id. If they
+// dismiss the menu without choosing (click elsewhere, press Escape), we
+// resolve with null.
+function registerMenuHandlers() {
+  ipcMain.handle('menu:popup', async (e, items, x, y) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win || !Array.isArray(items) || items.length === 0) return null;
+
+    return new Promise((resolve) => {
+      // Make sure we only answer the UI once — a menu click fires both the
+      // item's "click" handler AND the menu's close "callback", and we
+      // don't want the close callback to overwrite a real selection with
+      // null a moment later.
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+
+      // Turn the simple list the UI sent into the shape Electron's Menu
+      // API expects (separators for dividers, enabled/disabled flags, and
+      // a click handler that reports which item was chosen).
+      const template = items.map((item) => {
+        if (item && item.divider) return { type: 'separator' };
+        return {
+          label: String(item?.label ?? ''),
+          enabled: !item?.disabled,
+          click: () => finish(item?.id ?? null),
+        };
+      });
+
+      const menu = Menu.buildFromTemplate(template);
+      // x/y are optional: when provided (as pixel positions relative to
+      // the window), the menu opens there; otherwise it opens at the
+      // current mouse cursor. Round them so we never hand Electron a
+      // fractional pixel coordinate.
+      const options = {
+        window: win,
+        callback: () => finish(null),
+      };
+      if (typeof x === 'number' && typeof y === 'number' && Number.isFinite(x) && Number.isFinite(y)) {
+        options.x = Math.round(x);
+        options.y = Math.round(y);
+      }
+      menu.popup(options);
+    });
+  });
+}
+
 // Keeps a reference to the app's single main window so other parts of the
 // app (like the updater) can send it messages.
 let mainWindow = null;
@@ -158,6 +252,14 @@ function createWindow() {
   win.on('unmaximize', () => win.webContents.send('window:maximized', false));
 }
 
+// Must be set BEFORE the app finishes starting (before whenReady callbacks
+// create windows). Tells Chromium to allow websites to autoplay video/audio
+// without requiring a click first — matching how many people configure a
+// daily-driver browser, and fixing sites (YouTube Shorts, news clips, etc.)
+// that look "broken" when autoplay is blocked and their player UI never
+// fully initializes.
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
 // Once Electron has finished starting up, set everything in motion: remove
 // the default menu bar, wire up all the background functionality, make
 // sure the database is ready, and finally open the window.
@@ -167,6 +269,7 @@ app.whenReady().then(async () => {
   registerFolderHandlers();
   registerWindowHandlers();
   registerClipboardHandlers();
+  registerMenuHandlers();
   registerTerminalHandlers();
   registerFileHandlers();
   registerBrowserHandlers(() => mainWindow);

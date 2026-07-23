@@ -108,6 +108,35 @@ function sessionByTermId(termId) {
   return null;
 }
 
+// Formats text before writing it into the terminal shell process.
+//
+// Interactive CLI applications (like agy / Antigravity, Claude Code, etc.)
+// support "bracketed paste mode". When text is wrapped in special escape
+// sequences (\x1b[200~ ... \x1b[201~), the CLI application knows the text
+// was pasted all at once. This lets agy collapse multiline text into neat
+// "[Pasted Text #1 +100 lines]" blocks rather than executing every newline
+// as an ENTER keystroke and overflowing the prompt buffer.
+function formatPasteForTerminal(term, text) {
+  if (!text) return '';
+  // clipboard.readText() is async (returns a Promise). If it ever lands here
+  // by accident via `||`, bail out instead of crashing on .replace().
+  if (typeof text !== 'string') return '';
+
+  // Use real newline characters (\n), NOT carriage returns (\r).
+  //
+  // Why this matters: xterm.js historically turns pasted newlines into \r, but
+  // Windows TUI apps built on ultraviolet/bubbletea (agy / Antigravity) treat
+  // \n as the line break inside a bracketed paste. Their own Win32 input path
+  // even converts Enter keys to '\n' while collecting paste bytes. If we send
+  // only \r, the paste markers can arrive but the TUI still won't collapse the
+  // paste into a "[Pasted text #N +N lines]" chip the way Windows Terminal does.
+  const normalized = text.replace(/\r\n|\r/g, '\n');
+  if (term?.modes?.bracketedPasteMode || text.includes('\n') || text.includes('\r')) {
+    return `\x1b[200~${normalized}\x1b[201~`;
+  }
+  return normalized;
+}
+
 // ── Clickable links in terminal output ──
 //
 // Two separate systems work together here:
@@ -275,6 +304,37 @@ async function createSession(tabId, host, savedTerminalId, cwd, onNewTerminalId)
 
   term.open(host);
 
+  // Intercept native browser paste events on the terminal container in the capture phase
+  // before xterm's internal listener receives them. This prevents raw paste behavior
+  // (which omits bracketed paste escape sequences), and instead explicitly passes the text
+  // through formatPasteForTerminal. This guarantees bracketed paste markers
+  // (\x1b[200~ ... \x1b[201~) are sent for multiline pastes so agy displays them as
+  // "[Pasted Text #1 +100 lines]".
+  host.addEventListener(
+    'paste',
+    (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // Prefer the paste event's own clipboard data (sync). Fall back to our
+      // IPC clipboard helper only if the event carried nothing — and note that
+      // readText() is async, so formatPasteForTerminal ignores non-strings.
+      const text = e.clipboardData?.getData('text/plain') || '';
+      if (text && session?.termId && !session.dead) {
+        const formatted = formatPasteForTerminal(term, text);
+        window.terminals.write(session.termId, formatted);
+      } else if (!text && session?.termId && !session.dead) {
+        // Rare fallback: some Electron contexts leave clipboardData empty.
+        // Read the OS clipboard asynchronously and paste once it arrives.
+        window.clipboard.readText().then((clipText) => {
+          if (!clipText || !session?.termId || session.dead) return;
+          const formatted = formatPasteForTerminal(term, clipText);
+          window.terminals.write(session.termId, formatted);
+        });
+      }
+    },
+    true
+  );
+
   // Use the GPU-accelerated renderer (the same one VS Code uses) instead
   // of the default, slower DOM-based one — this makes fast scrolling
   // output dramatically smoother. Loaded AFTER term.open(), as the addon
@@ -349,9 +409,9 @@ async function createSession(tabId, host, savedTerminalId, cwd, onNewTerminalId)
   // Smart copy/paste: Ctrl+C copies the current selection (and, since a
   // selection exists, does NOT also send its usual SIGINT to the shell);
   // with nothing selected, Ctrl+C is left completely alone and behaves
-  // exactly as it always has. Ctrl+V always pastes. See
-  // terminalClipboard.js for the actual decision policy — this just wires
-  // xterm's real selection/clipboard into it.
+  // exactly as it always has. Ctrl+V always pastes using term.paste(text)
+  // so that xterm.js can handle bracketed paste mode (\x1b[200~ ... \x1b[201~)
+  // for interactive CLI tools (like agy / Antigravity CLI).
   term.attachCustomKeyEventHandler((event) =>
     handleTerminalKeyEvent(event, {
       hasSelection: () => term.hasSelection(),
@@ -359,7 +419,10 @@ async function createSession(tabId, host, savedTerminalId, cwd, onNewTerminalId)
       copyText: (text) => window.clipboard.writeText(text),
       readClipboardText: () => window.clipboard.readText(),
       pasteText: (text) => {
-        if (session.termId && !session.dead) window.terminals.write(session.termId, text);
+        if (session.termId && !session.dead) {
+          const formatted = formatPasteForTerminal(term, text);
+          window.terminals.write(session.termId, formatted);
+        }
       },
     })
   );
@@ -453,6 +516,7 @@ function syncSize(session) {
 // 2-letter stubs of every line. Ignoring degenerate sizes fixes that; the
 // resize watcher will fit again once the container has a real size.
 function safeFit(session) {
+  if (!session || !session.host) return;
   const rect = session.host.getBoundingClientRect();
   if (rect.width < 80 || rect.height < 40) return;
   const dims = session.fitAddon.proposeDimensions();
@@ -546,20 +610,6 @@ export default function TerminalPane({ tab, workspace }) {
           if (host.parentNode) host.parentNode.removeChild(host);
         }
       }).catch((err) => {
-        // Setup can fail outright — most commonly, the background process
-        // couldn't start the shell program at all (see terminal.js's
-        // createTerminal, which now throws a clear error for that case
-        // instead of leaving this hanging forever). Without this catch,
-        // that failure would be a silent, unhandled promise rejection and
-        // this pane would just sit there blank/spinning with no
-        // explanation and no way to recover.
-        //
-        // Depending on exactly when the failure happened, the terminal
-        // widget itself might already exist (registered in the module-wide
-        // `sessions` map) or might not have gotten that far yet — grab
-        // whichever is true so the SAME cleanup path below (which already
-        // knows how to dispose of a "dead" session) handles this one too,
-        // instead of needing special-case teardown logic.
         session = sessions.get(tab.id) || null;
         if (session) {
           session.dead = true;
@@ -578,16 +628,38 @@ export default function TerminalPane({ tab, workspace }) {
     // milliseconds before actually resizing anything, which feels instant
     // to the user but avoids that flicker.
     let fitTimer = null;
-    const resizeObserver = new ResizeObserver(() => {
+    let fitRaf = null;
+    const triggerFit = () => {
       if (fitTimer) clearTimeout(fitTimer);
       fitTimer = setTimeout(() => {
         fitTimer = null;
         if (!session || cancelled) return;
-        safeFit(session);
-        syncSize(session);
+        if (fitRaf) cancelAnimationFrame(fitRaf);
+        // Run safeFit inside a requestAnimationFrame so that measuring the DOM
+        // bounds happens cleanly at the start of the next frame, avoiding
+        // browser layout thrashing during active window resizes.
+        fitRaf = requestAnimationFrame(() => {
+          safeFit(session);
+          syncSize(session);
+        });
       }, 80);
+    };
+
+    const resizeObserver = new ResizeObserver(() => {
+      triggerFit();
     });
     resizeObserver.observe(container);
+
+    // Watch for High-DPI monitor scaling changes (e.g., dragging the window
+    // from a 4K 200% screen to a 1080p 100% display). When the pixel ratio
+    // changes, refresh the terminal canvas so text stays razor-sharp!
+    const handleDpiChange = () => {
+      if (session && !cancelled) {
+        safeFit(session);
+        session.term.refresh(0, session.term.rows - 1);
+      }
+    };
+    window.addEventListener('resize', handleDpiChange);
 
     // Cleanup, run when this pane is hidden (tab switch), moved, or
     // closed: stop watching for resizes and unplug the terminal's drawing
@@ -597,7 +669,9 @@ export default function TerminalPane({ tab, workspace }) {
     return () => {
       cancelled = true;
       resizeObserver.disconnect();
+      window.removeEventListener('resize', handleDpiChange);
       if (fitTimer) clearTimeout(fitTimer);
+      if (fitRaf) cancelAnimationFrame(fitRaf);
       if (session) {
         session.mounted = false;
         if (session.host.parentNode) session.host.parentNode.removeChild(session.host);
@@ -612,14 +686,16 @@ export default function TerminalPane({ tab, workspace }) {
   // Handles a file dropped in from an Editor pane's Explorer (see
   // EditorPane.jsx's draggable file rows), or a URL dropped in from a
   // Browser pane's address bar: types the dropped path/URL into the shell
-  // at wherever its own cursor currently is, exactly like a paste.
+  // at wherever its own cursor currently is, using term.paste so bracketed
+  // paste mode is respected.
   const handleDrop = (e) => {
     e.preventDefault();
     const dropped = e.dataTransfer.getData('text/plain');
     if (!dropped) return;
     const session = sessions.get(tab.id);
     if (!session || !session.termId || session.dead) return;
-    window.terminals.write(session.termId, pathForTerminalDrop(dropped));
+    const formatted = formatPasteForTerminal(session.term, pathForTerminalDrop(dropped));
+    window.terminals.write(session.termId, formatted);
   };
 
   return (

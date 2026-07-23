@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { memo, useRef, useState } from 'react';
 import PaneContent from './PaneContent';
 import TabBar from './TabBar';
 
@@ -10,7 +10,10 @@ import TabBar from './TabBar';
 // (browser/terminal/editor) below it. It also handles dragging tabs
 // around — both reordering/moving tabs between panes, and dropping a tab on
 // an edge of a pane to create a brand-new split.
-export default function PaneContainer({ pane, workspace }) {
+//
+// We wrap `PaneContainer` in `memo` so that edits or focus changes in ONE split
+// pane don't trigger unnecessary DOM re-renders in other separate split panes.
+const PaneContainer = memo(function PaneContainer({ pane, workspace }) {
   const { tabsById, focusPane, focusedPaneId, moveTabToPane, splitPane, duplicateTab } = workspace;
   const { id, activeTabId, tabIds } = pane;
   // A reference to this pane's outer DOM element, used to measure exactly
@@ -141,7 +144,9 @@ export default function PaneContainer({ pane, workspace }) {
       </div>
     </div>
   );
-}
+});
+
+export default PaneContainer;
 
 // The visual highlight shown during a tab drag, indicating where the tab
 // would land if dropped right now — either covering the whole pane

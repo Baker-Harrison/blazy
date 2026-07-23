@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Sidebar from './components/Sidebar';
 import TitleBar from './components/TitleBar';
 import UpdateNotification from './components/UpdateNotification';
@@ -36,6 +36,22 @@ function AppShell() {
   // (false). "useState" gives us a piece of memory that, when changed,
   // automatically causes the screen to redraw with the new value.
   const [sidebarOpen, setSidebarOpen] = useState(true);
+
+  // Automatically collapse the sidebar when the app window is resized below
+  // 768px (e.g., small screens, split windows on desktop, or tablet displays).
+  // This keeps the main content area spacious without forcing the user to manually
+  // close the sidebar every time they shrink the window.
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.innerWidth < 768) {
+        setSidebarOpen(false);
+      }
+    };
+    // Run once on initial load to set appropriate layout state for current screen size.
+    handleResize();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   // Figure out which workspace (if any) is the one currently selected/open,
   // by matching its id against workspaces.selectedId. "useMemo" just means

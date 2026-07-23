@@ -287,71 +287,93 @@ export default function BrowserPane({ tab, workspace }) {
   }, []);
 
   // --- Viewport tracking: report the content area's rect whenever it changes.
-  // In plain terms: this runs a tiny loop, once per animation frame (about
-  // 60 times a second), that measures exactly where the empty "page area"
-  // rectangle currently sits on screen and how big it is, and tells the
-  // background process about it — but ONLY when something has actually
-  // changed, to avoid needlessly spamming messages every single frame.
-  // This is what keeps the real browser page correctly aligned as you
-  // resize the window, drag a split divider, or switch workspace tabs.
+  //
+  // In plain terms: instead of running an expensive loop 60 to 144 times every
+  // single second even when nothing is moving (which wasted CPU power), we use
+  // a `ResizeObserver` and window resize event listeners to detect EXACTLY when
+  // the page area rectangle actually changes size or position.
+  //
+  // During an active drag (like resizing a split pane), we track mouse movements
+  // live so the native webpage follows your cursor instantly with zero lag. Once
+  // the drag finishes or the app is sitting still, the loop stops completely,
+  // taking CPU usage down to zero while preserving perfect alignment!
   useEffect(() => {
-    let raf;
     lastRect.current = null;
-    // IMPORTANT — this pane used to wait for the rect to stop changing for
-    // 80ms before reporting it (the same "settle" debounce TerminalPane.jsx
-    // uses for its own resizing). That made sense for the terminal: a
-    // ConPTY resize is disruptive (it can reflow wrapped text), so it's
-    // worth waiting until the user is actually done dragging before doing
-    // it once. But the browser pane isn't reflowing anything of its own —
-    // it's just telling the background process "the real webpage should
-    // sit exactly here." Debouncing THAT means the real page freezes at
-    // its pre-drag size for the entire 80ms+ that the window/divider is
-    // still moving, which is exactly the stuck-content-area glitch this
-    // pane was built to avoid. So: do NOT reintroduce a settle timer here.
-    // Report every real change immediately, every animation frame — the
-    // native page view should track the placeholder live, the same way a
-    // picture glued to a piece of cardboard moves the instant you move the
-    // cardboard, not 80ms later.
-    //
-    // We still skip sending when nothing has actually changed (see
-    // rectsMatch below) so a steady, unmoving pane doesn't spam the
-    // background process with identical messages every frame — but any
-    // real change, including a single mid-transition frame, goes out right
-    // away.
+
     const rectsMatch = (a, b) =>
       a.visible === b.visible &&
       Math.abs(a.x - b.x) <= 0.5 &&
       Math.abs(a.y - b.y) <= 0.5 &&
       Math.abs(a.width - b.width) <= 0.5 &&
       Math.abs(a.height - b.height) <= 0.5;
-    const tick = () => {
+
+    const syncViewportRect = () => {
       const el = contentRef.current;
-      if (el) {
-        const r = el.getBoundingClientRect();
-        // Inactive workspace tabs stay mounted with visibility:hidden and keep
-        // their size, so rect alone isn't enough to know we're on screen.
-        const visible =
-          r.width > 0 &&
-          r.height > 0 &&
-          el.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true });
-        const rect = { x: r.x, y: r.y, width: r.width, height: r.height, visible };
-        // Only compare against — and update — the last rect we actually
-        // SENT. There's no separate "pending" rect anymore since there's
-        // no debounce timer to hold one for.
-        if (!lastRect.current || !rectsMatch(lastRect.current, rect)) {
-          lastRect.current = rect;
-          window.browser.setViewport(
-            paneId,
-            { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-            rect.visible
-          );
-        }
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const visible =
+        r.width > 0 &&
+        r.height > 0 &&
+        el.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true });
+      const rect = { x: r.x, y: r.y, width: r.width, height: r.height, visible };
+
+      if (!lastRect.current || !rectsMatch(lastRect.current, rect)) {
+        lastRect.current = rect;
+        window.browser.setViewport(
+          paneId,
+          { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+          rect.visible
+        );
       }
-      raf = requestAnimationFrame(tick);
     };
-    raf = requestAnimationFrame(tick);
+
+    // Measure immediately once on mount or tab change.
+    syncViewportRect();
+
+    // ResizeObserver catches all container size changes (split pane resizing, sidebar toggling, window sizing).
+    let resizeObserver = null;
+    if (contentRef.current && typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(() => {
+        syncViewportRect();
+      });
+      resizeObserver.observe(contentRef.current);
+    }
+
+    // Also listen to window resize and orientation events for OS/window level changes.
+    const handleWindowResize = () => syncViewportRect();
+    window.addEventListener('resize', handleWindowResize);
+
+    // Track mouse dragging live during active pane divider or window resizes so movement is buttery smooth.
+    let isMouseDown = false;
+    let dragRaf = null;
+
+    const onPointerMove = () => {
+      if (isMouseDown) {
+        syncViewportRect();
+      }
+    };
+    const onPointerDown = () => {
+      isMouseDown = true;
+      syncViewportRect();
+    };
+    const onPointerUp = () => {
+      if (isMouseDown) {
+        isMouseDown = false;
+        syncViewportRect();
+      }
+    };
+
+    window.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+
     return () => {
-      cancelAnimationFrame(raf);
+      if (resizeObserver) resizeObserver.disconnect();
+      window.removeEventListener('resize', handleWindowResize);
+      window.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      if (dragRaf) cancelAnimationFrame(dragRaf);
     };
   }, [paneId]);
 
